@@ -21,6 +21,10 @@ dependencies = [
   "batman-package>=2.4.9",
 ]
 
+
+[project.scripts]
+kepler5-inspect = "exoplanet_search.cli:main"
+
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0",
@@ -35,6 +39,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
 
 [tool.ruff]
 line-length = 100
