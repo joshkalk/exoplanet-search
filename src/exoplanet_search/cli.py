@@ -10,10 +10,14 @@ from .config import (
     DATA_RAW_DIR,
     DEFAULT_INSPECTION_DIR,
     DEFAULT_RECOVERY_DIR,
+    DEFAULT_WINDOWED_RECOVERY_DIR,
     DEFAULT_TARGET,
+    KEPLER5B_BASELINE_MASK_SCALE,
     KEPLER5B_DURATION_HOURS,
     KEPLER5B_EPOCH_BKJD,
     KEPLER5B_PERIOD_DAYS,
+    KEPLER5B_TRANSIT_MASK_SCALE,
+    KEPLER5B_WINDOW_HALF_WIDTH_DAYS,
 )
 from .data_access import download_kepler_light_curve
 from .inspection import (
@@ -21,7 +25,12 @@ from .inspection import (
     save_light_curve_plot,
     summarize_light_curve,
 )
-from .recovery import estimate_known_transit_signal, save_folded_transit_plot
+from .recovery import (
+    estimate_known_transit_signal,
+    estimate_windowed_known_transit_signal,
+    save_folded_transit_plot,
+    save_windowed_transit_plot,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -54,6 +63,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=DEFAULT_RECOVERY_DIR,
         help="Directory for recovery outputs (default: data/interim/kepler5_recovery)",
+    )
+    parser.add_argument(
+        "--windowed-recovery",
+        action="store_true",
+        help="Run a local-window known-period recovery check around each expected transit.",
+    )
+    parser.add_argument(
+        "--windowed-recovery-output-dir",
+        type=Path,
+        default=DEFAULT_WINDOWED_RECOVERY_DIR,
+        help="Directory for windowed recovery outputs (default: data/interim/kepler5_windowed_recovery)",
     )
     return parser
 
@@ -123,6 +143,41 @@ def main() -> None:
         print(f"Wrote recovery summary: {recovery_summary_path}")
         print(f"Wrote folded plot: {folded_plot_path}")
         print(json.dumps(recovery_summary, indent=2))
+
+    if args.windowed_recovery:
+        args.windowed_recovery_output_dir.mkdir(parents=True, exist_ok=True)
+        windowed_summary = estimate_windowed_known_transit_signal(
+            processed_curve,
+            period_days=KEPLER5B_PERIOD_DAYS,
+            epoch_bkjd=KEPLER5B_EPOCH_BKJD,
+            duration_hours=KEPLER5B_DURATION_HOURS,
+            window_half_width_days=KEPLER5B_WINDOW_HALF_WIDTH_DAYS,
+            transit_mask_scale=KEPLER5B_TRANSIT_MASK_SCALE,
+            baseline_mask_scale=KEPLER5B_BASELINE_MASK_SCALE,
+        )
+        windowed_summary.update({"target": args.target, "time_system": "BKJD"})
+
+        windowed_summary_path = args.windowed_recovery_output_dir / "windowed_recovery_summary.json"
+        windowed_plot_path = args.windowed_recovery_output_dir / "windowed_folded_light_curve.png"
+
+        with windowed_summary_path.open("w", encoding="utf-8") as output_file:
+            json.dump(windowed_summary, output_file, indent=2)
+
+        save_windowed_transit_plot(
+            processed_curve,
+            windowed_plot_path,
+            target_name=args.target,
+            period_days=KEPLER5B_PERIOD_DAYS,
+            epoch_bkjd=KEPLER5B_EPOCH_BKJD,
+            duration_hours=KEPLER5B_DURATION_HOURS,
+            window_half_width_days=KEPLER5B_WINDOW_HALF_WIDTH_DAYS,
+            transit_mask_scale=KEPLER5B_TRANSIT_MASK_SCALE,
+            baseline_mask_scale=KEPLER5B_BASELINE_MASK_SCALE,
+        )
+
+        print(f"Wrote windowed recovery summary: {windowed_summary_path}")
+        print(f"Wrote windowed folded plot: {windowed_plot_path}")
+        print(json.dumps(windowed_summary, indent=2))
 
 
 if __name__ == "__main__":
