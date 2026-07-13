@@ -30,8 +30,14 @@ pytest
 
 ### 3) Run first validation step (Kepler-5)
 
-This command downloads Kepler-5 light-curve products via `lightkurve`, applies only light preprocessing
-(remove NaNs, remove high-sigma outliers, normalize), and writes a quick summary + plot.
+This command downloads Kepler-5 light-curve products via `lightkurve`, stitches
+the selected FITS flux column after explicit per-product normalization, removes
+non-finite cadences, applies an additional global median normalization, and
+writes a quick summary + plot. The default scientific preprocessing mode is
+`none`, which means no generic flux-amplitude clipping is applied. This
+preserves downward transit-like excursions, asymmetric shoulders,
+ingress/egress structure, and unusual short cadence sequences for later
+analysis.
 
 ```bash
 kepler5-inspect
@@ -41,6 +47,13 @@ Equivalent module invocation:
 
 ```bash
 python -m exoplanet_search.cli
+```
+
+To run a different preprocessing mode for the ordinary inspection/recovery
+outputs:
+
+```bash
+python -m exoplanet_search.cli --preprocessing-mode positive_only
 ```
 
 ### 4) Run minimal Kepler-5 recovery
@@ -62,6 +75,38 @@ robust known-period recovery check.
 python -m exoplanet_search.cli --windowed-recovery
 ```
 
+### 6) Compare preprocessing modes
+
+Phase 0 includes a diagnostic comparison that runs the same downloaded Kepler-5
+data through four preprocessing modes:
+
+- `none`: remove non-finite cadences, apply the Lightkurve download quality
+  policy, normalize, and perform no flux-amplitude clipping. Non-finite
+  removals are accounted for separately from clipping. This is the default and
+  the appropriate baseline for blind searches.
+- `positive_only`: remove only sufficiently extreme positive flux excursions
+  using the five-sigma convention, while preserving downward excursions.
+- `symmetric`: preserve the old symmetric five-sigma clipping behavior as a
+  comparison mode. This can erase real transit cadences and is not the blind
+  search default.
+- `transit_protected_symmetric`: protect the published Kepler-5 b transit
+  windows, then apply symmetric clipping outside them. This is target-specific
+  and diagnostic only; it is not suitable for blind searches.
+
+```bash
+python -m exoplanet_search.cli --compare-preprocessing
+```
+
+Known Kepler-5 b ephemeris values are used only after preprocessing for
+diagnostics: recovery plots, cadence-removal phase counts, and comparison
+summaries. Current SNR values are diagnostic proxies, not formal false-alarm
+probabilities or detection claims.
+
+The recovery and comparison flags are Kepler-5-specific because they use the
+published Kepler-5 b ephemeris. For other targets, use the ordinary inspection
+command without `--recover`, `--windowed-recovery`, `--compare-preprocessing`,
+or `--preprocessing-mode transit_protected_symmetric`.
+
 ### Outputs
 
 - Download cache/files: `data/raw/`
@@ -74,5 +119,18 @@ python -m exoplanet_search.cli --windowed-recovery
 - Windowed recovery outputs: `data/interim/kepler5_windowed_recovery/`
   - `windowed_recovery_summary.json`
   - `windowed_folded_light_curve.png`
+- Preprocessing comparison outputs: `data/interim/kepler5_preprocessing_comparison/`
+  - `preprocessing_comparison_summary.json`
+  - `phase_binned_removed_cadences.csv`
+  - `provenance_manifest.json`
+  - `preprocessing_comparison.png`
 
 These directories are already git-ignored for generated data products.
+
+Each run records provenance where available, including UTC timestamp, Git commit
+and dirty status, Python and package versions, target query, mission, cadence,
+source FITS flux column, stitched-flux normalization policy, time system,
+Lightkurve quality bitmask policy, preprocessing parameters, cadence counts,
+raw input filenames, FITS header metadata, and SHA-256 checksums. If exact FITS
+paths are not exposed by Lightkurve, the manifest records that limitation
+instead of assigning unrelated files under `data/raw/` to the run.
