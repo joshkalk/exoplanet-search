@@ -27,6 +27,9 @@ Do not work on exomoon modeling yet unless explicitly asked.
 - Use `lightkurve`, `astropy`, and `batman-package` where appropriate.
 - Keep units and time systems explicit.
 - Be cautious with detrending so real transit signals are not removed.
+- Keep the default preprocessing transit-preserving: remove non-finite values,
+  use a documented Kepler quality-mask policy, normalize conservatively, and do
+  not apply generic flux-amplitude clipping by default.
 - Record assumptions clearly in docstrings or comments.
 
 ## Data handling

@@ -6,12 +6,16 @@ DEFAULT_TARGET = "Kepler-5"
 DEFAULT_MISSION = "Kepler"
 DEFAULT_AUTHOR = "Kepler"
 DEFAULT_CADENCE = "long"
+DEFAULT_FLUX_COLUMN = "pdcsap_flux"
+DEFAULT_QUALITY_BITMASK = "default"
+DEFAULT_TIME_SYSTEM = "BKJD"
 
 DATA_RAW_DIR = Path("data/raw")
 DATA_INTERIM_DIR = Path("data/interim")
 DEFAULT_INSPECTION_DIR = DATA_INTERIM_DIR / "kepler5_inspection"
 DEFAULT_RECOVERY_DIR = DATA_INTERIM_DIR / "kepler5_recovery"
 DEFAULT_WINDOWED_RECOVERY_DIR = DATA_INTERIM_DIR / "kepler5_windowed_recovery"
+DEFAULT_COMPARISON_DIR = DATA_INTERIM_DIR / "kepler5_preprocessing_comparison"
 
 # Kepler-5 b ephemeris from the NASA Exoplanet Archive DR25 KOI solution.
 # Kepler light-curve times are handled in BKJD for this recovery step.

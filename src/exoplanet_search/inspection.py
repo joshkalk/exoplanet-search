@@ -5,21 +5,21 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
+from .config import DEFAULT_TIME_SYSTEM
+from .preprocessing import PreprocessingConfig, preprocess_light_curve
+
 
 def lightly_preprocess_light_curve(light_curve, sigma: float = 5.0, normalize: bool = True):
-    """Apply conservative preprocessing suitable for initial data-quality inspection.
+    """Backward-compatible default preprocessing wrapper.
 
-    Steps are intentionally minimal to avoid suppressing astrophysical transit signals:
-    - remove NaNs
-    - remove only high-sigma outliers
-    - optional flux normalization
+    The scientific default is no flux-amplitude clipping; ``sigma`` is retained
+    for API compatibility with older calls.
     """
-    processed = light_curve.remove_nans()
-    if sigma > 0:
-        processed = processed.remove_outliers(sigma=sigma)
-    if normalize:
-        processed = processed.normalize()
-    return processed
+    result = preprocess_light_curve(
+        light_curve,
+        PreprocessingConfig(mode="none", sigma=sigma, normalize=normalize),
+    )
+    return result.light_curve
 
 
 def summarize_light_curve(light_curve) -> dict[str, float]:
@@ -35,13 +35,18 @@ def summarize_light_curve(light_curve) -> dict[str, float]:
     }
 
 
-def save_light_curve_plot(light_curve, output_path: Path, target_name: str) -> None:
+def save_light_curve_plot(
+    light_curve,
+    output_path: Path,
+    target_name: str,
+    time_system: str = DEFAULT_TIME_SYSTEM,
+) -> None:
     """Save a simple scatter plot for visual confirmation the data loaded."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     figure, axis = plt.subplots(figsize=(10, 4))
     light_curve.scatter(ax=axis, color="black", s=0.5)
     axis.set_title(f"{target_name} light curve (inspection view)")
-    axis.set_xlabel("Time [BTJD]")
+    axis.set_xlabel(f"Time [{time_system}]")
     axis.set_ylabel("Relative Flux")
     figure.tight_layout()
     figure.savefig(output_path, dpi=150)
