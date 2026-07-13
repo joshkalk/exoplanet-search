@@ -30,12 +30,14 @@ pytest
 
 ### 3) Run first validation step (Kepler-5)
 
-This command downloads Kepler-5 light-curve products via `lightkurve`, removes
-non-finite cadences, normalizes the flux, and writes a quick summary + plot.
-The default scientific preprocessing mode is `none`, which means no generic
-flux-amplitude clipping is applied. This preserves downward transit-like
-excursions, asymmetric shoulders, ingress/egress structure, and unusual short
-cadence sequences for later analysis.
+This command downloads Kepler-5 light-curve products via `lightkurve`, stitches
+the selected FITS flux column after explicit per-product normalization, removes
+non-finite cadences, applies an additional global median normalization, and
+writes a quick summary + plot. The default scientific preprocessing mode is
+`none`, which means no generic flux-amplitude clipping is applied. This
+preserves downward transit-like excursions, asymmetric shoulders,
+ingress/egress structure, and unusual short cadence sequences for later
+analysis.
 
 ```bash
 kepler5-inspect
@@ -79,8 +81,9 @@ Phase 0 includes a diagnostic comparison that runs the same downloaded Kepler-5
 data through four preprocessing modes:
 
 - `none`: remove non-finite cadences, apply the Lightkurve download quality
-  policy, normalize, and perform no flux-amplitude clipping. This is the default
-  and the appropriate baseline for blind searches.
+  policy, normalize, and perform no flux-amplitude clipping. Non-finite
+  removals are accounted for separately from clipping. This is the default and
+  the appropriate baseline for blind searches.
 - `positive_only`: remove only sufficiently extreme positive flux excursions
   using the five-sigma convention, while preserving downward excursions.
 - `symmetric`: preserve the old symmetric five-sigma clipping behavior as a
@@ -98,6 +101,11 @@ Known Kepler-5 b ephemeris values are used only after preprocessing for
 diagnostics: recovery plots, cadence-removal phase counts, and comparison
 summaries. Current SNR values are diagnostic proxies, not formal false-alarm
 probabilities or detection claims.
+
+The recovery and comparison flags are Kepler-5-specific because they use the
+published Kepler-5 b ephemeris. For other targets, use the ordinary inspection
+command without `--recover`, `--windowed-recovery`, `--compare-preprocessing`,
+or `--preprocessing-mode transit_protected_symmetric`.
 
 ### Outputs
 
@@ -121,5 +129,8 @@ These directories are already git-ignored for generated data products.
 
 Each run records provenance where available, including UTC timestamp, Git commit
 and dirty status, Python and package versions, target query, mission, cadence,
-flux product, time system, Lightkurve quality bitmask policy, preprocessing
-parameters, cadence counts, raw input filenames, and SHA-256 checksums.
+source FITS flux column, stitched-flux normalization policy, time system,
+Lightkurve quality bitmask policy, preprocessing parameters, cadence counts,
+raw input filenames, FITS header metadata, and SHA-256 checksums. If exact FITS
+paths are not exposed by Lightkurve, the manifest records that limitation
+instead of assigning unrelated files under `data/raw/` to the run.

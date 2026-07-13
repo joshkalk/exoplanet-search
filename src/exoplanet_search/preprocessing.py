@@ -64,6 +64,7 @@ class PreprocessingResult:
             "cadence_count_after_nonfinite_removal": self.finite_count,
             "cadence_count_after_quality_filtering": self.quality_filtered_count,
             "cadence_count_after_flux_clipping": self.output_count,
+            "nonfinite_removed_cadence_count": int(np.count_nonzero(~self.finite_mask)),
             "clipped_cadence_count": self.clipped_count,
             "total_removed_cadence_count": self.removed_count,
             "total_removed_fraction": self.removed_fraction,
@@ -195,19 +196,33 @@ def removal_diagnostics(
         duration_hours=duration_hours,
         transit_mask_scale=transit_mask_scale,
     )
-    removed_mask = ~result.retained_mask
+    nonfinite_removed_mask = ~result.finite_mask
+    clipped_removed_mask = result.clipped_mask
+    removed_mask = nonfinite_removed_mask | clipped_removed_mask
 
     counts = {
         "retained_inside_known_transit_window": int(
             np.count_nonzero(result.retained_mask & diagnostic_transit_mask)
         ),
-        "removed_inside_known_transit_window": int(
-            np.count_nonzero(removed_mask & diagnostic_transit_mask)
-        ),
         "retained_outside_known_transit_window": int(
             np.count_nonzero(result.retained_mask & ~diagnostic_transit_mask)
         ),
-        "removed_outside_known_transit_window": int(
+        "nonfinite_removed_inside_known_transit_window": int(
+            np.count_nonzero(nonfinite_removed_mask & diagnostic_transit_mask)
+        ),
+        "nonfinite_removed_outside_known_transit_window": int(
+            np.count_nonzero(nonfinite_removed_mask & ~diagnostic_transit_mask)
+        ),
+        "flux_clipped_inside_known_transit_window": int(
+            np.count_nonzero(clipped_removed_mask & diagnostic_transit_mask)
+        ),
+        "flux_clipped_outside_known_transit_window": int(
+            np.count_nonzero(clipped_removed_mask & ~diagnostic_transit_mask)
+        ),
+        "total_removed_inside_known_transit_window": int(
+            np.count_nonzero(removed_mask & diagnostic_transit_mask)
+        ),
+        "total_removed_outside_known_transit_window": int(
             np.count_nonzero(removed_mask & ~diagnostic_transit_mask)
         ),
     }
@@ -226,15 +241,19 @@ def removal_diagnostics(
         else:
             bin_mask = (phase_fraction >= edges[index]) & (phase_fraction < edges[index + 1])
         total = int(np.count_nonzero(bin_mask))
-        removed = int(np.count_nonzero(bin_mask & removed_mask))
+        nonfinite_removed = int(np.count_nonzero(bin_mask & nonfinite_removed_mask))
+        flux_clipped = int(np.count_nonzero(bin_mask & clipped_removed_mask))
+        total_removed = nonfinite_removed + flux_clipped
         rows.append(
             {
                 "phase_bin": index,
                 "phase_start": float(edges[index]),
                 "phase_end": float(edges[index + 1]),
                 "cadence_count": total,
-                "removed_count": removed,
-                "removed_fraction": float(removed / total) if total else 0.0,
+                "nonfinite_removed_count": nonfinite_removed,
+                "flux_clipped_count": flux_clipped,
+                "total_removed_count": total_removed,
+                "total_removed_fraction": float(total_removed / total) if total else 0.0,
             }
         )
     return counts, rows

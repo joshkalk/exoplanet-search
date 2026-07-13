@@ -14,6 +14,15 @@ from .config import (
     DEFAULT_TARGET,
 )
 
+STITCHING_POLICY = {
+    "method": "LightCurveCollection.stitch",
+    "corrector_func": "per_product_light_curve_normalize",
+    "description": (
+        "Each downloaded light curve is normalized with LightCurve.normalize() "
+        "before stitching, matching Lightkurve's historical default explicitly."
+    ),
+}
+
 
 @dataclass(frozen=True)
 class KeplerLightCurveBundle:
@@ -24,8 +33,9 @@ class KeplerLightCurveBundle:
     mission: str
     author: str
     cadence: str
-    flux_column: str
+    source_flux_column: str
     quality_bitmask: str | int
+    stitching_policy: dict[str, str]
     downloaded_paths: tuple[Path, ...]
     n_products: int
 
@@ -87,16 +97,15 @@ def download_kepler_light_curve_bundle(
         raise RuntimeError("Download returned no files. Check network access and Lightkurve setup.")
 
     downloaded_paths = _extract_downloaded_paths(collection)
-    if not downloaded_paths and download_dir is not None:
-        downloaded_paths = tuple(sorted(Path(download_dir).rglob("*.fits")))
     return KeplerLightCurveBundle(
-        light_curve=collection.stitch(),
+        light_curve=collection.stitch(corrector_func=_normalize_before_stitch),
         target=target,
         mission=mission,
         author=author,
         cadence=cadence,
-        flux_column=flux_column,
+        source_flux_column=flux_column,
         quality_bitmask=quality_bitmask,
+        stitching_policy=STITCHING_POLICY,
         downloaded_paths=downloaded_paths,
         n_products=len(collection),
     )
@@ -113,3 +122,8 @@ def _extract_downloaded_paths(collection) -> tuple[Path, ...]:
                     paths.append(path)
                 break
     return tuple(paths)
+
+
+def _normalize_before_stitch(light_curve):
+    """Normalize each product before stitching to preserve the explicit policy."""
+    return light_curve.normalize()

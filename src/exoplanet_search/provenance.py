@@ -12,6 +12,8 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
+from astropy.io import fits
+
 
 PACKAGE_DISTRIBUTIONS = (
     "numpy",
@@ -34,11 +36,23 @@ def build_provenance_manifest(
     time_system: str,
     quality_bitmask: str | int,
     preprocessing: dict[str, Any],
+    stitching_policy: dict[str, Any] | None = None,
     downloaded_paths: tuple[Path, ...] = (),
     cadence_counts: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create a JSON-serializable run provenance manifest."""
     raw_files = [_raw_file_record(path) for path in downloaded_paths]
+    limitations = [
+        (
+            "Per-cadence counts before Lightkurve quality masking are not available from the "
+            "stitched LightCurve returned by the current download path."
+        )
+    ]
+    if not raw_files:
+        limitations.append(
+            "Exact downloaded FITS paths were not exposed by the Lightkurve objects; raw input "
+            "file checksums and FITS header metadata were not recorded for this run."
+        )
     return {
         "run_timestamp_utc": datetime.now(UTC).isoformat(),
         "git": {
@@ -55,8 +69,14 @@ def build_provenance_manifest(
         "mission": mission,
         "author": author,
         "cadence": cadence,
-        "flux_product": flux_product,
+        "source_fits_flux_column": flux_product,
+        "analyzed_flux": (
+            "stitched flux from the source FITS column after explicit per-product "
+            "LightCurve.normalize(); preprocessing may apply an additional global median "
+            "normalization."
+        ),
         "time_system": time_system,
+        "stitching_policy": stitching_policy or {},
         "quality_mask_policy": {
             "lightkurve_quality_bitmask": quality_bitmask,
             "application_stage": "Lightkurve SearchResult.download_all while reading FITS products",
@@ -65,12 +85,7 @@ def build_provenance_manifest(
         "preprocessing": preprocessing,
         "raw_inputs": raw_files,
         "cadence_counts": cadence_counts or {},
-        "limitations": [
-            (
-                "Per-cadence counts before Lightkurve quality masking are not available from the "
-                "stitched LightCurve returned by the current download path."
-            )
-        ],
+        "limitations": limitations,
     }
 
 
@@ -82,15 +97,55 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _raw_file_record(path: Path) -> dict[str, Any]:
+    header_metadata = _fits_header_metadata(path)
     record: dict[str, Any] = {
         "path": str(path),
         "name": path.name,
         "sha256": _sha256(path),
+        "fits_header_metadata": header_metadata,
     }
-    quarter = _quarter_from_name(path.name)
-    if quarter is not None:
-        record["kepler_quarter"] = quarter
+    if "quarter" in header_metadata:
+        record["kepler_quarter"] = header_metadata["quarter"]
     return record
+
+
+def _fits_header_metadata(path: Path) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    try:
+        with fits.open(path, memmap=False) as hdul:
+            headers = [hdu.header for hdu in hdul]
+            _copy_first_header_value(headers, metadata, "quarter", ("QUARTER",))
+            _copy_first_header_value(
+                headers,
+                metadata,
+                "data_release",
+                ("DATA_REL", "DATREL", "DRN"),
+            )
+            _copy_first_header_value(
+                headers,
+                metadata,
+                "pipeline_version",
+                ("PROCVER", "PIPEVER", "SOCVER"),
+            )
+    except OSError:
+        metadata["header_read_error"] = True
+    return metadata
+
+
+def _copy_first_header_value(
+    headers,
+    metadata: dict[str, Any],
+    output_key: str,
+    header_keys: tuple[str, ...],
+) -> None:
+    for header in headers:
+        for header_key in header_keys:
+            if header_key in header:
+                value = header[header_key]
+                if hasattr(value, "item"):
+                    value = value.item()
+                metadata[output_key] = value
+                return
 
 
 def _sha256(path: Path) -> str:
@@ -99,21 +154,6 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: input_file.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
-
-
-def _quarter_from_name(name: str) -> int | None:
-    marker = "_q"
-    lower_name = name.lower()
-    if marker not in lower_name:
-        return None
-    after_marker = lower_name.split(marker, maxsplit=1)[1]
-    digits = ""
-    for char in after_marker:
-        if char.isdigit():
-            digits += char
-        else:
-            break
-    return int(digits) if digits else None
 
 
 def _git_output(*args: str) -> str:

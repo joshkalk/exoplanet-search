@@ -37,6 +37,7 @@ def run_preprocessing_comparison(
     cadence: str,
     flux_product: str,
     quality_bitmask: str | int,
+    stitching_policy: dict[str, Any] | None = None,
     downloaded_paths: tuple[Path, ...] = (),
 ) -> dict[str, Any]:
     """Run all preprocessing modes and save diagnostic comparison products."""
@@ -105,6 +106,7 @@ def run_preprocessing_comparison(
             "comparison_modes": list(PREPROCESSING_MODES),
             "known_ephemeris_use": "diagnostic_only",
         },
+        stitching_policy=stitching_policy,
         downloaded_paths=downloaded_paths,
         cadence_counts={
             mode_summary["mode"]: mode_summary["preprocessing"]
@@ -135,8 +137,10 @@ def _write_phase_rows(path: Path, rows: list[dict[str, Any]]) -> None:
         "phase_start",
         "phase_end",
         "cadence_count",
-        "removed_count",
-        "removed_fraction",
+        "nonfinite_removed_count",
+        "flux_clipped_count",
+        "total_removed_count",
+        "total_removed_fraction",
     ]
     with path.open("w", encoding="utf-8", newline="") as output_file:
         writer = csv.DictWriter(output_file, fieldnames=fieldnames)
@@ -147,8 +151,8 @@ def _write_phase_rows(path: Path, rows: list[dict[str, Any]]) -> None:
 def _save_comparison_plot(path: Path, mode_summaries: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     modes = [summary["mode"] for summary in mode_summaries]
-    removed = [
-        summary["preprocessing"]["total_removed_cadence_count"]
+    clipped = [
+        summary["preprocessing"]["clipped_cadence_count"]
         for summary in mode_summaries
     ]
     depths = [
@@ -161,8 +165,8 @@ def _save_comparison_plot(path: Path, mode_summaries: list[dict[str, Any]]) -> N
     ]
 
     figure, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
-    axes[0].bar(modes, removed, color="tab:gray")
-    axes[0].set_ylabel("Removed cadences")
+    axes[0].bar(modes, clipped, color="tab:gray")
+    axes[0].set_ylabel("Flux-clipped cadences")
     axes[0].set_title("Effect of preprocessing mode on Kepler-5 diagnostics")
 
     axes[1].plot(modes, depths, marker="o", label="Folded depth proxy")

@@ -118,8 +118,27 @@ def test_cadence_removal_accounting_counts_transit_and_phase_bins():
         phase_bins=5,
     )
 
-    assert counts["removed_inside_known_transit_window"] > 0
-    assert sum(row["removed_count"] for row in phase_rows) == result.removed_count
+    assert counts["flux_clipped_inside_known_transit_window"] > 0
+    assert sum(row["total_removed_count"] for row in phase_rows) == result.removed_count
+
+
+def test_none_mode_separates_nonfinite_transit_removals_from_clipping():
+    lc, injected_transit_mask = make_synthetic_transit_light_curve()
+    transit_index = int(np.flatnonzero(injected_transit_mask)[0])
+    lc.flux[transit_index] = np.nan
+
+    result = preprocess_light_curve(lc, PreprocessingConfig(mode="none"))
+    counts, _ = removal_diagnostics(
+        lc,
+        result,
+        period_days=PERIOD_DAYS,
+        epoch_bkjd=EPOCH_BKJD,
+        duration_hours=DURATION_HOURS,
+    )
+
+    assert result.clipped_count == 0
+    assert counts["nonfinite_removed_inside_known_transit_window"] == 1
+    assert counts["flux_clipped_inside_known_transit_window"] == 0
 
 
 def test_provenance_manifest_serializes(tmp_path):

@@ -122,6 +122,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    _validate_target_specific_options(args)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     args.download_dir.mkdir(parents=True, exist_ok=True)
@@ -152,7 +153,7 @@ def main() -> None:
         {
             "target": args.target,
             "time_system": DEFAULT_TIME_SYSTEM,
-            "flux_product": args.flux_column,
+            "source_fits_flux_column": args.flux_column,
             "quality_bitmask": args.quality_bitmask,
             "preprocessing": preprocessing_result.summary(),
         }
@@ -179,6 +180,7 @@ def main() -> None:
         time_system=DEFAULT_TIME_SYSTEM,
         quality_bitmask=args.quality_bitmask,
         preprocessing=preprocessing_result.summary(),
+        stitching_policy=bundle.stitching_policy,
         downloaded_paths=bundle.downloaded_paths,
         cadence_counts=preprocessing_result.summary(),
     )
@@ -273,6 +275,7 @@ def main() -> None:
             cadence=args.cadence,
             flux_product=args.flux_column,
             quality_bitmask=args.quality_bitmask,
+            stitching_policy=bundle.stitching_policy,
             downloaded_paths=bundle.downloaded_paths,
         )
         print(f"Wrote preprocessing comparison outputs: {args.comparison_output_dir}")
@@ -289,6 +292,28 @@ def _preprocessing_config_from_args(mode: str) -> PreprocessingConfig:
             transit_mask_scale=KEPLER5B_TRANSIT_MASK_SCALE,
         )
     return PreprocessingConfig(mode=mode)
+
+
+def _validate_target_specific_options(args) -> None:
+    target_is_kepler5 = _is_kepler5_target(args.target)
+    requested_known_ephemeris = (
+        args.recover
+        or args.windowed_recovery
+        or args.compare_preprocessing
+        or args.preprocessing_mode == "transit_protected_symmetric"
+    )
+    if requested_known_ephemeris and not target_is_kepler5:
+        raise SystemExit(
+            "Known-ephemeris recovery, preprocessing comparison, and "
+            "transit_protected_symmetric mode are currently implemented only for "
+            "Kepler-5. Run ordinary inspection without those flags, or add a "
+            "target-specific ephemeris before using these diagnostics."
+        )
+
+
+def _is_kepler5_target(target: str) -> bool:
+    normalized = target.lower().replace(" ", "").replace("-", "")
+    return normalized in {"kepler5", "kic8191672", "8191672"}
 
 
 if __name__ == "__main__":
