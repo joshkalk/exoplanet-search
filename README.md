@@ -52,6 +52,16 @@ known Kepler-5 b ephemeris to confirm the expected transit signal is present.
 python -m exoplanet_search.cli --recover
 ```
 
+### 5) Run windowed known-period recovery
+
+This cuts out windows around each expected Kepler-5 b transit, normalizes each
+window using only the local out-of-transit wings, and stacks them for a more
+robust known-period recovery check.
+
+```bash
+python -m exoplanet_search.cli --windowed-recovery
+```
+
 ### Outputs
 
 - Download cache/files: `data/raw/`
@@ -61,5 +71,8 @@ python -m exoplanet_search.cli --recover
 - Recovery outputs: `data/interim/kepler5_recovery/`
   - `recovery_summary.json`
   - `folded_light_curve.png`
+- Windowed recovery outputs: `data/interim/kepler5_windowed_recovery/`
+  - `windowed_recovery_summary.json`
+  - `windowed_folded_light_curve.png`
 
 These directories are already git-ignored for generated data products.
