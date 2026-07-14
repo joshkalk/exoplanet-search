@@ -134,3 +134,60 @@ Lightkurve quality bitmask policy, preprocessing parameters, cadence counts,
 raw input filenames, FITS header metadata, and SHA-256 checksums. If exact FITS
 paths are not exposed by Lightkurve, the manifest records that limitation
 instead of assigning unrelated files under `data/raw/` to the run.
+
+## Phase 1A: blind period search
+
+Phase 1A asks whether the Phase 0 Kepler-5 light curve can independently recover
+a repeating transit using generic Box Least Squares settings. The search uses
+Astropy's `BoxLeastSquares`, the Phase 0 default no-clipping preprocessing, and
+a chronological split: the first 70% of the observed time baseline selects the
+candidate, while the final 30% is held out for fixed-ephemeris validation.
+
+The blind search does not use the published Kepler-5 b period, epoch, duration,
+or depth for preprocessing, period bounds, duration choices, peak selection,
+alias checks, or holdout evaluation. Published values are used only afterward in
+`published_comparison.json`.
+
+Default BLS settings are broad and generic: periods from about 0.5 to 100 days
+with the upper bound limited by the training baseline to require at least three
+possible transits, a 5000-sample uniform-frequency period grid, and broad trial
+durations from 1 to 12 hours. Broad peaks are discovery locations only. Phase 1A
+then performs a local, training-only refinement around each leading period
+family using an explicit period-step rule:
+`delta_P <= allowed_phase_drift_fraction * duration * period / training_baseline`.
+This keeps the accumulated timing drift across the training baseline small
+relative to the transit duration before any holdout cadences are evaluated.
+
+The selected candidate is the highest-power locally refined training candidate
+after period-neighborhood deduplication. The holdout period, transit time, and
+duration are locked from that refined training result; the holdout is not
+recentered or retuned. Phase 1A also records small-integer harmonic families and
+odd/even depth diagnostics so half-period, double-period, and related aliases are
+visible instead of hidden inside a single "best period" field.
+
+A full-mission global BLS search is still written as a stability and alias
+diagnostic, but it is not labeled as refinement and it does not replace the
+locked training family. The full-mission local refinement is stored separately
+and is centered on the locked refined training candidate.
+
+```bash
+python -m exoplanet_search.cli --blind-period-search
+```
+
+Outputs are written to `data/interim/kepler5_phase1a_search/`:
+
+- `search_summary.json`
+- `top_period_candidates.csv`
+- `alias_diagnostics.csv`
+- `holdout_event_diagnostics.csv`
+- `odd_even_diagnostics.csv`
+- `harmonic_family_diagnostics.csv`
+- `periodogram.png`
+- `recovered_folded_light_curve.png`
+- `holdout_folded_light_curve.png`
+- `published_comparison.json`
+- `provenance_manifest.json`
+
+The BLS power and SNR-like values are diagnostic statistics only. Phase 1A does
+not perform BATMAN fitting, physical parameter inference, false-alarm
+probabilities, or planet validation.

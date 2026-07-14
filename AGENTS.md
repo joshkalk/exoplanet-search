@@ -30,6 +30,9 @@ Do not work on exomoon modeling yet unless explicitly asked.
 - Keep the default preprocessing transit-preserving: remove non-finite values,
   use a documented Kepler quality-mask policy, normalize conservatively, and do
   not apply generic flux-amplitude clipping by default.
+- For blind period-search work, keep generic search and holdout code independent
+  of published Kepler-5 b ephemeris values; use literature values only in
+  clearly separated post-search diagnostics.
 - Record assumptions clearly in docstrings or comments.
 
 ## Data handling

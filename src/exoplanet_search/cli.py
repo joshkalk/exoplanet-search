@@ -14,6 +14,7 @@ from .config import (
     DEFAULT_FLUX_COLUMN,
     DEFAULT_INSPECTION_DIR,
     DEFAULT_MISSION,
+    DEFAULT_PHASE1A_DIR,
     DEFAULT_QUALITY_BITMASK,
     DEFAULT_RECOVERY_DIR,
     DEFAULT_TIME_SYSTEM,
@@ -32,6 +33,7 @@ from .inspection import (
     save_light_curve_plot,
     summarize_light_curve,
 )
+from .phase1a import BLSSearchConfig, run_phase1a_search
 from .preprocessing import PREPROCESSING_MODES, PreprocessingConfig, preprocess_light_curve
 from .provenance import build_provenance_manifest, write_json
 from .recovery import (
@@ -117,6 +119,29 @@ def build_parser() -> argparse.ArgumentParser:
             "(default: data/interim/kepler5_preprocessing_comparison)"
         ),
     )
+    parser.add_argument(
+        "--blind-period-search",
+        action="store_true",
+        help="Run Phase 1A blind BLS period search with chronological holdout validation.",
+    )
+    parser.add_argument(
+        "--phase1a-output-dir",
+        type=Path,
+        default=DEFAULT_PHASE1A_DIR,
+        help="Directory for Phase 1A blind-search outputs (default: data/interim/kepler5_phase1a_search)",
+    )
+    parser.add_argument("--bls-min-period", type=float, default=0.5, help="Minimum BLS period in days.")
+    parser.add_argument("--bls-max-period", type=float, default=100.0, help="Maximum BLS period in days.")
+    parser.add_argument("--bls-min-duration-hours", type=float, default=1.0)
+    parser.add_argument("--bls-max-duration-hours", type=float, default=12.0)
+    parser.add_argument("--bls-n-durations", type=int, default=12)
+    parser.add_argument("--bls-n-periods", type=int, default=5000)
+    parser.add_argument("--bls-frequency-factor", type=float, default=1.0)
+    parser.add_argument("--bls-oversample", type=int, default=10)
+    parser.add_argument("--bls-local-duration-step-hours", type=float, default=0.25)
+    parser.add_argument("--bls-local-max-period-samples", type=int, default=8000)
+    parser.add_argument("--bls-allowed-drift-fraction", type=float, default=0.10)
+    parser.add_argument("--training-fraction", type=float, default=0.70)
     return parser
 
 
@@ -281,6 +306,60 @@ def main() -> None:
         print(f"Wrote preprocessing comparison outputs: {args.comparison_output_dir}")
         print(json.dumps(comparison_summary, indent=2))
 
+    if args.blind_period_search:
+        phase1a_config = BLSSearchConfig(
+            minimum_period_days=args.bls_min_period,
+            maximum_period_days=args.bls_max_period,
+            minimum_duration_hours=args.bls_min_duration_hours,
+            maximum_duration_hours=args.bls_max_duration_hours,
+            n_durations=args.bls_n_durations,
+            n_periods=args.bls_n_periods,
+            frequency_factor=args.bls_frequency_factor,
+            oversample=args.bls_oversample,
+            local_duration_step_hours=args.bls_local_duration_step_hours,
+            local_max_period_samples=args.bls_local_max_period_samples,
+            allowed_phase_drift_fraction=args.bls_allowed_drift_fraction,
+            training_fraction=args.training_fraction,
+        )
+        phase1a_provenance = build_provenance_manifest(
+            target=args.target,
+            mission=args.mission,
+            author=args.author,
+            cadence=args.cadence,
+            flux_product=args.flux_column,
+            time_system=DEFAULT_TIME_SYSTEM,
+            quality_bitmask=args.quality_bitmask,
+            preprocessing=preprocessing_result.summary(),
+            stitching_policy=bundle.stitching_policy,
+            downloaded_paths=bundle.downloaded_paths,
+            cadence_counts=preprocessing_result.summary(),
+        )
+        published_ephemeris = _published_kepler5_ephemeris() if _is_kepler5_target(args.target) else None
+        phase1a_summary = run_phase1a_search(
+            processed_curve,
+            output_dir=args.phase1a_output_dir,
+            target=args.target,
+            config=phase1a_config,
+            provenance=phase1a_provenance,
+            published_ephemeris=published_ephemeris,
+        )
+        locked = phase1a_summary["locked_refined_training_candidate"]
+        holdout = phase1a_summary["holdout_summary"]
+        print(f"Wrote Phase 1A blind-search outputs: {args.phase1a_output_dir}")
+        print(
+            "Locked refined training candidate: "
+            f"period={locked['refined_period_days']:.8f} d, "
+            f"transit_time={locked['refined_transit_time']:.8f}, "
+            f"duration={locked['refined_duration_hours']:.3f} h, "
+            f"depth={locked['refined_depth_ppm']:.1f} ppm, "
+            f"BLS power={locked['refined_bls_power']:.6g}"
+        )
+        print(
+            "Holdout: "
+            f"{holdout['usable_event_count']}/{holdout['predicted_event_count']} usable events, "
+            f"depth={holdout['aggregate_depth_ppm']:.1f} ppm"
+        )
+
 
 def _preprocessing_config_from_args(mode: str) -> PreprocessingConfig:
     if mode == "transit_protected_symmetric":
@@ -314,6 +393,14 @@ def _validate_target_specific_options(args) -> None:
 def _is_kepler5_target(target: str) -> bool:
     normalized = target.lower().replace(" ", "").replace("-", "")
     return normalized in {"kepler5", "kic8191672", "8191672"}
+
+
+def _published_kepler5_ephemeris() -> dict[str, float]:
+    return {
+        "period_days": KEPLER5B_PERIOD_DAYS,
+        "epoch_bkjd": KEPLER5B_EPOCH_BKJD,
+        "duration_hours": KEPLER5B_DURATION_HOURS,
+    }
 
 
 if __name__ == "__main__":
