@@ -15,6 +15,7 @@ from .config import (
     DEFAULT_INSPECTION_DIR,
     DEFAULT_MISSION,
     DEFAULT_PHASE1A_DIR,
+    DEFAULT_PHASE1B_DIR,
     DEFAULT_QUALITY_BITMASK,
     DEFAULT_RECOVERY_DIR,
     DEFAULT_TIME_SYSTEM,
@@ -34,6 +35,8 @@ from .inspection import (
     summarize_light_curve,
 )
 from .phase1a import BLSSearchConfig, run_phase1a_search
+from .phase1b import run_phase1b_fit
+from .phase1b_types import Phase1BConfig
 from .preprocessing import PREPROCESSING_MODES, PreprocessingConfig, preprocess_light_curve
 from .provenance import build_provenance_manifest, write_json
 from .recovery import (
@@ -142,6 +145,39 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bls-local-max-period-samples", type=int, default=8000)
     parser.add_argument("--bls-allowed-drift-fraction", type=float, default=0.10)
     parser.add_argument("--training-fraction", type=float, default=0.70)
+    parser.add_argument(
+        "--physical-transit-fit",
+        action="store_true",
+        help="Run Phase 1B deterministic BATMAN physical transit fit from Phase 1A outputs.",
+    )
+    parser.add_argument(
+        "--phase1a-summary-path",
+        type=Path,
+        default=DEFAULT_PHASE1A_DIR / "search_summary.json",
+        help="Path to Phase 1A search_summary.json.",
+    )
+    parser.add_argument(
+        "--phase1a-provenance-path",
+        type=Path,
+        default=DEFAULT_PHASE1A_DIR / "provenance_manifest.json",
+        help="Path to Phase 1A provenance_manifest.json.",
+    )
+    parser.add_argument(
+        "--stellar-inputs-path",
+        type=Path,
+        default=Path("data/interim/kepler5_phase1b_stellar_inputs.json"),
+        help="JSON file containing reproducible stellar and limb-darkening inputs.",
+    )
+    parser.add_argument(
+        "--phase1b-output-dir",
+        type=Path,
+        default=DEFAULT_PHASE1B_DIR,
+        help="Directory for Phase 1B deterministic fit outputs.",
+    )
+    parser.add_argument("--phase1b-n-starts", type=int, default=14)
+    parser.add_argument("--phase1b-random-seed", type=int, default=481516)
+    parser.add_argument("--phase1b-supersample-factor", type=int, default=11)
+    parser.add_argument("--phase1b-high-supersample-factor", type=int, default=21)
     return parser
 
 
@@ -358,6 +394,49 @@ def main() -> None:
             "Holdout: "
             f"{holdout['usable_event_count']}/{holdout['predicted_event_count']} usable events, "
             f"depth={holdout['aggregate_depth_ppm']:.1f} ppm"
+        )
+
+    if args.physical_transit_fit:
+        phase1b_config = Phase1BConfig(
+            phase1a_summary_path=args.phase1a_summary_path,
+            phase1a_provenance_path=args.phase1a_provenance_path,
+            stellar_inputs_path=args.stellar_inputs_path,
+            output_dir=args.phase1b_output_dir,
+            cadence=args.cadence,
+            random_seed=args.phase1b_random_seed,
+            n_starts=args.phase1b_n_starts,
+            supersample_factor=args.phase1b_supersample_factor,
+            high_supersample_factor=args.phase1b_high_supersample_factor,
+        )
+        try:
+            phase1b_summary = run_phase1b_fit(
+                bundle=bundle,
+                output_dir=args.phase1b_output_dir,
+                config=phase1b_config,
+                target=args.target,
+                mission=args.mission,
+                author=args.author,
+                cadence=args.cadence,
+                flux_product=args.flux_column,
+                quality_bitmask=args.quality_bitmask,
+                preprocessing=preprocessing_result.summary(),
+            )
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            raise SystemExit(f"Phase 1B physical transit fit failed: {exc}") from exc
+        result = phase1b_summary["fitted_results"]["global_timing_refinement"]
+        windows = phase1b_summary["transit_windows"]
+        print(f"Wrote Phase 1B deterministic fit outputs: {args.phase1b_output_dir}")
+        print(
+            "Phase 1B timing-refined fit: "
+            f"Rp/Rstar={result['rp_over_rstar']:.6f}, "
+            f"a/Rstar={result['a_over_rstar']:.6f}, "
+            f"b={result['impact_parameter']:.6f}, "
+            f"objective={result['objective_value']:.6g}"
+        )
+        print(
+            "Transit windows: "
+            f"{windows['included_count']}/{windows['predicted_count']} included, "
+            f"{windows['excluded_count']} excluded"
         )
 
 

@@ -191,3 +191,69 @@ Outputs are written to `data/interim/kepler5_phase1a_search/`:
 The BLS power and SNR-like values are diagnostic statistics only. Phase 1A does
 not perform BATMAN fitting, physical parameter inference, false-alarm
 probabilities, or planet validation.
+
+## Phase 1B: deterministic physical transit fit
+
+Phase 1B asks whether the signal independently recovered in Phase 1A can be
+represented by a physically valid, exposure-integrated BATMAN transit model. It
+uses the Phase 0 Kepler long-cadence Pre-search Data Conditioning Simple
+Aperture Photometry (PDCSAP) path with preprocessing mode `none`: the existing
+Kepler quality mask, explicit per-product normalization before stitching,
+non-finite removal, conservative normalization, and no generic flux-amplitude
+clipping.
+
+The Phase 1B starting ephemeris comes from
+`data/interim/kepler5_phase1a_search/search_summary.json`, specifically
+`full_mission_local_refinement`. The locked training-only Phase 1A ephemeris is
+preserved in the Phase 1B provenance so the original predictive recovery remains
+auditable.
+
+```bash
+python -m exoplanet_search.cli --physical-transit-fit
+```
+
+Configurable inputs:
+
+```bash
+python -m exoplanet_search.cli \
+  --physical-transit-fit \
+  --phase1a-summary-path data/interim/kepler5_phase1a_search/search_summary.json \
+  --phase1a-provenance-path data/interim/kepler5_phase1a_search/provenance_manifest.json \
+  --stellar-inputs-path data/interim/kepler5_phase1b_stellar_inputs.json \
+  --phase1b-output-dir data/interim/kepler5_phase1b_fit
+```
+
+The stellar input file must contain independently sourced stellar-atmosphere
+inputs and reproducible Kepler-band quadratic limb-darkening coefficients or
+physical `q1`/`q2` values with source metadata. Phase 1B stops clearly if that
+file is absent; it does not substitute arbitrary limb-darkening coefficients.
+
+The fit is unbinned. Transit windows are selected using objective coverage rules
+around every predicted Phase 1A full-mission transit center, and every predicted
+event receives an audit row whether accepted or excluded. The physical model is
+a circular, one-planet, quadratic-limb-darkened BATMAN model with finite
+long-cadence exposure integration. Each accepted transit window has its own
+multiplicative linear local baseline, solved analytically inside the
+deterministic objective rather than pre-normalized and treated as exact.
+
+Outputs are written to `data/interim/kepler5_phase1b_fit/`, including
+`phase1b_summary.json`, `phase1b_configuration.json`,
+`phase1a_input_record.json`, `observation_product_metadata.csv`,
+`transit_window_audit.csv`, `accepted_fit_cadences.csv`,
+`event_baseline_parameters.csv`, `multistart_diagnostics.csv`,
+`deterministic_fit_parameters.csv`, `timing_refinement_comparison.json`,
+`limb_darkening_inputs.json`, `limb_darkening_comparison.json`,
+`exposure_integration_convergence.csv`, `stability_diagnostics.csv`,
+`residual_summary.json`, `residuals.csv`, `residual_acf.csv`,
+`residual_rms_binning.csv`, diagnostic PNG plots, and
+`provenance_manifest.json`.
+
+Phase 1B is deterministic and diagnostic. It records multi-start optimizer
+behavior, residuals, exposure-integration convergence, fixed versus fitted
+limb-darkening results, timing-refinement shifts, and stability checks, but it
+does not claim final parameter uncertainties. Posterior sampling and convergence
+analysis are deferred to Phase 1B-B.
+
+Published physical planet values for Kepler-5 b are not used for Phase 1B
+initialization, bounds, fitting, tests, diagnostics, or comparison in this
+branch.
