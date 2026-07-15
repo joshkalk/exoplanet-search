@@ -1,0 +1,295 @@
+{
+  "schema_version": "1.0.0",
+  "retrieval_creation_date": "2026-07-15",
+  "target": {
+    "name": "Kepler-5",
+    "kepler_input_catalog_identifier": 8191672
+  },
+  "stellar_inputs": {
+    "effective_temperature": {
+      "value": 6297.0,
+      "unit": "K",
+      "symmetric_uncertainty": 60.0,
+      "uncertainty_unit": "K"
+    },
+    "spectroscopic_logg": {
+      "value": 3.96,
+      "unit": "dex cgs",
+      "symmetric_uncertainty": 0.10,
+      "uncertainty_unit": "dex"
+    },
+    "metallicity_feh": {
+      "value": 0.04,
+      "unit": "dex",
+      "symmetric_uncertainty": 0.06,
+      "uncertainty_unit": "dex"
+    }
+  },
+  "source": {
+    "title": "Discovery of the Transiting Planet Kepler-5b",
+    "authors_year": "Koch et al. 2010",
+    "publication": "Astrophysical Journal Letters",
+    "arxiv_identifier": "arXiv:1001.0913",
+    "table_field_description": "Observed stellar parameters from spectroscopic analysis: Teff, spectroscopic log(g), and [Fe/H].",
+    "measurement_method": "spectroscopy"
+  },
+  "anti_leakage": {
+    "no_planet_fit_parameters_copied": true,
+    "statement": "Only independently measured stellar-atmosphere inputs were copied. No published Kepler-5b planet radius, scaled semimajor axis, inclination, impact parameter, transit depth, duration, period, epoch, stellar density, stellar mass, stellar radius, or transit-fit parameter was used.",
+    "logg_selection": "The spectroscopic log(g) = 3.96 +/- 0.10 dex was selected because it is an atmosphere input directly measured from spectroscopy. The derived stellar log(g) = 4.07 +/- 0.02, stellar density, stellar mass, and stellar radius were not used because they incorporate stellar-evolution and transit-density information and are not independent atmosphere inputs for this analysis."
+  },
+  "limb_darkening_package": "ExoTiC-LD",
+  "limb_darkening_package_version": "3.2.0",
+  "ld_data_version": "3.2.0",
+  "atmosphere_grid": "mps1",
+  "interpolation_behavior": {
+    "type": "trilinear",
+    "central_grid_cube": {
+      "metallicity_feh": [0.0, 0.05],
+      "effective_temperature_K": [6200.0, 6300.0],
+      "logg_dex_cgs": [3.5, 4.0]
+    },
+    "uncertainty_grid_vertices_used": {
+      "metallicity_feh": [-0.05, 0.0, 0.05, 0.1],
+      "effective_temperature_K": [6200.0, 6300.0, 6400.0],
+      "logg_dex_cgs": [3.5, 4.0, 4.2]
+    },
+    "windows_compatibility_note": "ExoTiC-LD 3.2.0 generated Windows remote URLs with backslashes for missing grid files. The same MPS1 grid files were therefore prefetched from the ExoTiC-LD data host with forward-slash URLs into ld_data_path before running ExoTiC-LD unchanged against the local cache."
+  },
+  "kepler_bandpass_identifier": "SVO FPS Kepler/Kepler.K",
+  "bandpass": {
+    "source": "Spanish Virtual Observatory Filter Profile Service",
+    "filter_id": "Kepler/Kepler.K",
+    "description": "Kepler filter",
+    "wavelength_unit": "Angstrom",
+    "wavelength_min": 3480.0,
+    "wavelength_max": 9700.0,
+    "transmission_sample_count": 623,
+    "effective_wavelength": 5978.1376050303,
+    "mode_passed_to_exotic_ld": "custom"
+  },
+  "calculation_settings": {
+    "ld_model": "mps1",
+    "ld_data_path": "data/interim/exotic_ld_data",
+    "interpolate_type": "trilinear",
+    "quadratic_mu_min": 0.10,
+    "quadratic_fit_algorithm": "Levenberg-Marquardt",
+    "kipping_fit_algorithm": "constrained Trust-Region Reflective",
+    "stellar_uncertainty_propagation": "One-at-a-time +/-1 sigma perturbations in Teff, spectroscopic log(g), and [Fe/H]; half-difference sensitivities combined in quadrature."
+  },
+  "quadratic_coefficients": {
+    "u1": 0.329711803874385,
+    "u2": 0.28107225540814473,
+    "q1": 0.37305716629003294,
+    "q2": 0.2699086536063832
+  },
+  "coefficient_uncertainties": {
+    "u1_fit_sigma": 0.014126833824518608,
+    "u2_fit_sigma": 0.018198523062859576,
+    "q1_fit_sigma": 0.006086826450710154,
+    "q2_fit_sigma": 0.013312326110605292,
+    "u1_stellar_sigma": 0.006250301842827528,
+    "u2_stellar_sigma": 0.0019291154952635196,
+    "q1_sigma": 0.005732732332449362,
+    "q2_sigma": 0.003117952296870317,
+    "q1_stellar_sigma": 0.005732732332449362,
+    "q2_stellar_sigma": 0.003117952296870317,
+    "stellar_sigma_terms": {
+      "u1": {
+        "teff": 0.005746270194514236,
+        "logg": 0.000009438083173884948,
+        "feh": 0.0024589759861935456
+      },
+      "u2": {
+        "teff": 0.001790364608061451,
+        "logg": 0.0007174731641856058,
+        "feh": 0.000036241177412937864
+      },
+      "q1": {
+        "teff": 0.004832778686313849,
+        "logg": 0.0008649472601792441,
+        "feh": 0.0029597865466498285
+      },
+      "q2": {
+        "teff": 0.002954835756539681,
+        "logg": 0.00032072236397809317,
+        "feh": 0.0009421832850766143
+      }
+    },
+    "phase1b_prior_width_note": "The JSON records stellar-input propagated q1/q2 sigmas. The Phase 1B fitter applies its configured moderate floor when constructing the deterministic Gaussian penalty."
+  },
+  "profile_validation": {
+    "quadratic_profile_minimum_intensity_over_mu_0_to_1": 0.38921594071747034,
+    "quadratic_profile_nonnegative_over_mu_0_to_1": true,
+    "quadratic_profile_monotonically_limb_darkened": true,
+    "monotonic_definition": "I(mu) is monotonically nondecreasing from limb mu=0 to disk center mu=1."
+  },
+  "one_sigma_perturbation_results": {
+    "central": {
+      "teff_K": 6297,
+      "logg_dex_cgs": 3.96,
+      "feh_dex": 0.04,
+      "u1": 0.329711803874385,
+      "u2": 0.28107225540814473,
+      "q1": 0.37305716629003294,
+      "q2": 0.2699086536063832
+    },
+    "teff_minus_1sigma": {
+      "teff_K": 6237,
+      "logg_dex_cgs": 3.96,
+      "feh_dex": 0.04,
+      "u1": 0.33566022145375574,
+      "u2": 0.279126582691314,
+      "q1": 0.377962814841298,
+      "q2": 0.2729891223491581
+    },
+    "teff_plus_1sigma": {
+      "teff_K": 6357,
+      "logg_dex_cgs": 3.96,
+      "feh_dex": 0.04,
+      "u1": 0.32416768106472726,
+      "u2": 0.2827073119074369,
+      "q1": 0.3682972574686703,
+      "q2": 0.26707945083607876
+    },
+    "logg_minus_1sigma": {
+      "teff_K": 6297,
+      "logg_dex_cgs": 3.86,
+      "feh_dex": 0.04,
+      "u1": 0.32986726801951755,
+      "u2": 0.28023338132310044,
+      "q1": 0.37222280310910505,
+      "q2": 0.27033839880607946
+    },
+    "logg_plus_1sigma": {
+      "teff_K": 6297,
+      "logg_dex_cgs": 4.06,
+      "feh_dex": 0.04,
+      "u1": 0.3298483918531698,
+      "u2": 0.28166832765147165,
+      "q1": 0.37395269762946354,
+      "q2": 0.2696969540781233
+    },
+    "feh_minus_1sigma": {
+      "teff_K": 6297,
+      "logg_dex_cgs": 3.96,
+      "feh_dex": -0.02,
+      "u1": 0.32731184039889816,
+      "u2": 0.28110138399888274,
+      "q1": 0.3701666522779153,
+      "q2": 0.26898810313276533
+    },
+    "feh_plus_1sigma": {
+      "teff_K": 6297,
+      "logg_dex_cgs": 3.96,
+      "feh_dex": 0.10,
+      "u1": 0.33222979237128525,
+      "u2": 0.28102890164405686,
+      "q1": 0.37608622537121494,
+      "q2": 0.27087246970291856
+    }
+  },
+  "downloaded_model_data": {
+    "remote_base_url": "https://www.star.bris.ac.uk/exotic-ld-data",
+    "cache_directory": "data/interim/exotic_ld_data",
+    "file_count": 24,
+    "files_sha256": [
+      {
+        "path": "data/interim/exotic_ld_data/mps1/MH-0.05/teff6200/logg3.5/mps1_spectra.dat",
+        "sha256": "33e062d7dffde4d64aaeedafd4cefa621c705ffd34d5214ba343345c071fea8b"
+      },
+      {
+        "path": "data/interim/exotic_ld_data/mps1/MH-0.05/teff6200/logg4.0/mps1_spectra.dat",
+        "sha256": "964e03c41b799eb068a2c5c20b71c53a32f9ba793656d3a945c6556c6a395ff2"
+      },
+      {
+        "path": "data/interim/exotic_ld_data/mps1/MH-0.05/teff6300/logg3.5/mps1_spectra.dat",
+        "sha256": "04d8d8db97e96346784e596fd857ad9652d657e81ab15cb693dc499584bd2029"
+      },
+      {
+        "path": "data/interim/exotic_ld_data/mps1/MH-0.05/teff6300/logg4.0/mps1_spectra.dat",
+        "sha256": "caf567750440ea78a1a98b9e91b88a5e0989b99daaea64361c0619bf116d1d1d"
+      },
+      {
+        "path": "data/interim/exotic_ld_data/mps1/MH0.0/teff6200/logg3.5/mps1_spectra.dat",
+        "sha256": "a77ca13ef2b2a71cdb5fd166e0401769178d91ee43d3cf3af69daf4c831f7b66"
+      },
+      {
+        "path": "data/interim/exotic_ld_data/mps1/MH0.0/teff6200/logg4.0/mps1_spectra.dat",
+        "sha256": "6159c23c60584ced795e8d7e65111dcd835c7c992336bca5da1e243a998ba71f"
+      },
+      {
+        "path": "data/interim/exotic_ld_data/mps1/MH0.0/teff6200/logg4.2/mps1_spectra.dat",
+        "sha256": "44164985033a5310dc151facd884d97485449bf8fb61ef82fd6381e60d284eb4"
+      },
+      {
+        "path": "data/interim/exotic_ld_data/mps1/MH0.0/teff6300/logg3.5/mps1_spectra.dat",
+        "sha256": "c3ddb733c84ddaea37bcadec4d3de615a7a998dc63ab12b2c5905d9242d498bb"
+      },
+      {
+        "path": "data/interim/exotic_ld_data/mps1/MH0.0/teff6300/logg4.0/mps1_spectra.dat",
+        "sha256": "6b0a4f00d7dae142f09f411c98fb16e88dbeee72df79d711e1f4eab5b53c4d67"
+      },
+      {
+        "path": "data/interim/exotic_ld_data/mps1/MH0.0/teff6300/logg4.2/mps1_spectra.dat",
+        "sha256": "227a78ea972e9e55e83505b694c1be2d6be7264c2ea14a00038b172b3adab2fc"
+      },
+      {
+        "path": "data/interim/exotic_ld_data/mps1/MH0.0/teff6400/logg3.5/mps1_spectra.dat",
+        "sha256": "bb981ca6ba23365820cac89439e3e57523cb39e5ad6f6c855a64c48233d14b75"
+      },
+      {
+        "path": "data/interim/exotic_ld_data/mps1/MH0.0/teff6400/logg4.0/mps1_spectra.dat",
+        "sha256": "924d2256a7b0eb4a4f3a3be6184ec3e6913bacba302dbf2e2dd7607568266c70"
+      },
+      {
+        "path": "data/interim/exotic_ld_data/mps1/MH0.05/teff6200/logg3.5/mps1_spectra.dat",
+        "sha256": "267cba6af9b48382d66f802affcb06af291da0275fdb536fc7f10b47e7add027"
+      },
+      {
+        "path": "data/interim/exotic_ld_data/mps1/MH0.05/teff6200/logg4.0/mps1_spectra.dat",
+        "sha256": "a8244fd8e08f422c8ffc2a6880662fd0a296699f6e64f6f7605bd3b91a65d388"
+      },
+      {
+        "path": "data/interim/exotic_ld_data/mps1/MH0.05/teff6200/logg4.2/mps1_spectra.dat",
+        "sha256": "13a5b954fb60afc2937461639b7594b701df46bdbb121dcc8be74202ee5f658e"
+      },
+      {
+        "path": "data/interim/exotic_ld_data/mps1/MH0.05/teff6300/logg3.5/mps1_spectra.dat",
+        "sha256": "2ff40f7f872930990392367e589d08684d8ddfa3c8f821298751bc097984f69b"
+      },
+      {
+        "path": "data/interim/exotic_ld_data/mps1/MH0.05/teff6300/logg4.0/mps1_spectra.dat",
+        "sha256": "84388b042f74416020e24361833958e09c2f5930d5bfe7b90b94da486a61debb"
+      },
+      {
+        "path": "data/interim/exotic_ld_data/mps1/MH0.05/teff6300/logg4.2/mps1_spectra.dat",
+        "sha256": "5a6ea63957e057b1ee963cd8789169af85ed08108eb94d799fc6772a629ed06c"
+      },
+      {
+        "path": "data/interim/exotic_ld_data/mps1/MH0.05/teff6400/logg3.5/mps1_spectra.dat",
+        "sha256": "45fc09c5fd122b370f1d089cde69230d647040ea16dae9267d24c1e918881639"
+      },
+      {
+        "path": "data/interim/exotic_ld_data/mps1/MH0.05/teff6400/logg4.0/mps1_spectra.dat",
+        "sha256": "61dc9c6ca5c58f777cc560edc901858e293e3d2eec157ba52a8788ddc045afc2"
+      },
+      {
+        "path": "data/interim/exotic_ld_data/mps1/MH0.1/teff6200/logg3.5/mps1_spectra.dat",
+        "sha256": "10e486c7b18f06d81277fba2d6d8ae52293e4d3250a1224463ef829c64b60bae"
+      },
+      {
+        "path": "data/interim/exotic_ld_data/mps1/MH0.1/teff6200/logg4.0/mps1_spectra.dat",
+        "sha256": "d05ee60be2744b5de3baeb58e9ec9b6fd7d6760f5f70603b389c69f0d1b9c3d1"
+      },
+      {
+        "path": "data/interim/exotic_ld_data/mps1/MH0.1/teff6300/logg3.5/mps1_spectra.dat",
+        "sha256": "5976bba4546814da3c3ab2027d52886edd706e9c01ce063847d137a82a2327c6"
+      },
+      {
+        "path": "data/interim/exotic_ld_data/mps1/MH0.1/teff6300/logg4.0/mps1_spectra.dat",
+        "sha256": "ef10d9b1af1ea6f449ba410f8f3de7b00df01fb9c7b2e05f1cc3fb635dc38017"
+      }
+    ]
+  }
+}
