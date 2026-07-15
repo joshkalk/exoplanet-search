@@ -38,6 +38,7 @@ class KeplerLightCurveBundle:
     stitching_policy: dict[str, str]
     downloaded_paths: tuple[Path, ...]
     n_products: int
+    product_light_curves: tuple[object, ...] = ()
 
 
 def download_kepler_light_curve(
@@ -97,6 +98,7 @@ def download_kepler_light_curve_bundle(
         raise RuntimeError("Download returned no files. Check network access and Lightkurve setup.")
 
     downloaded_paths = _extract_downloaded_paths(collection)
+    product_light_curves = tuple(collection)
     return KeplerLightCurveBundle(
         light_curve=collection.stitch(corrector_func=_normalize_before_stitch),
         target=target,
@@ -108,6 +110,7 @@ def download_kepler_light_curve_bundle(
         stitching_policy=STITCHING_POLICY,
         downloaded_paths=downloaded_paths,
         n_products=len(collection),
+        product_light_curves=product_light_curves,
     )
 
 

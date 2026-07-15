@@ -9,6 +9,26 @@ def test_plain_inspection_allows_non_kepler5_target():
     _validate_target_specific_options(args)
 
 
+def test_physical_transit_fit_parser_accepts_configurable_paths(tmp_path):
+    args = build_parser().parse_args(
+        [
+            "--physical-transit-fit",
+            "--phase1a-summary-path",
+            str(tmp_path / "summary.json"),
+            "--phase1a-provenance-path",
+            str(tmp_path / "provenance.json"),
+            "--stellar-inputs-path",
+            str(tmp_path / "stellar.json"),
+            "--phase1b-output-dir",
+            str(tmp_path / "phase1b"),
+        ]
+    )
+
+    assert args.physical_transit_fit is True
+    assert args.phase1a_summary_path == tmp_path / "summary.json"
+    assert args.stellar_inputs_path == tmp_path / "stellar.json"
+
+
 @pytest.mark.parametrize(
     "flag",
     [
