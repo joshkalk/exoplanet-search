@@ -6,7 +6,12 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from exoplanet_search.phase1c import prepare_run_config, synthetic_dataset
+from exoplanet_search.phase1c import (
+    prepare_run_config,
+    run_phase1c_synthetic_validation,
+    summarize_phase1c_checkpoints,
+    synthetic_dataset,
+)
 from exoplanet_search import phase1c_diagnostics as diagnostics_module
 from exoplanet_search.phase1c_diagnostics import (
     convergence_diagnostics,
@@ -305,7 +310,7 @@ def test_checkpoint_metadata_validation_and_resume_extension_equivalence(tmp_pat
         n_ensembles=1,
         n_walkers=16,
         chunk_steps=3,
-        warmup_steps=2,
+        warmup_steps=1,
         synthetic_steps=8,
     )
     resumed = run_ensembles(data2, mutable_resume_config, timing2, steps=8, mode="synthetic", resume=True)
@@ -322,9 +327,9 @@ def test_checkpoint_metadata_validation_and_resume_extension_equivalence(tmp_pat
     immutable_change = Phase1CConfig(
         output_dir=tmp_path / "two",
         n_ensembles=1,
-        n_walkers=18,
+        n_walkers=16,
         chunk_steps=2,
-        warmup_steps=1,
+        warmup_steps=2,
         synthetic_steps=8,
     )
     data3, timing3, _ = synthetic_dataset(immutable_change)
@@ -373,7 +378,7 @@ def test_convergence_requires_complete_parameter_diagnostics(monkeypatch):
         chain,
         log_prob,
         np.full(16, 0.3),
-        np.full(len(PARAMETER_ORDER), 0.1),
+        _autocorr_report(ensembles=2, tau=0.1, retained_steps=19),
         Phase1CConfig(convergence_ess_minimum=100.0),
         warmup_steps=1,
         posterior_stability={"passed": True},
@@ -382,6 +387,131 @@ def test_convergence_requires_complete_parameter_diagnostics(monkeypatch):
 
     assert diagnostics["status"] == "nonconverged"
     assert diagnostics["criteria"]["complete_valid_rhat"] is False
+
+
+def test_autocorrelation_rule_requires_every_ensemble_parameter(monkeypatch):
+    rng = np.random.default_rng(11)
+    chain = rng.normal(size=(4, 120, len(PARAMETER_ORDER)))
+    log_prob = np.zeros((4, 120))
+
+    def fake_arviz(_chain):
+        return {
+            "split_rhat": {name: 1.0 for name in PARAMETER_ORDER},
+            "bulk_ess": {name: 10_000.0 for name in PARAMETER_ORDER},
+            "tail_ess": {name: 10_000.0 for name in PARAMETER_ORDER},
+        }
+
+    monkeypatch.setattr(diagnostics_module, "_arviz_diagnostics", fake_arviz)
+    rows = [
+        {
+            "ensemble": ensemble,
+            "parameter": parameter,
+            "tau": 1.0,
+            "available": True,
+            "retained_steps": 119,
+            "error": None,
+        }
+        for ensemble in range(2)
+        for parameter in PARAMETER_ORDER
+    ]
+    rows[0] = {**rows[0], "tau": None, "available": False, "error": "missing"}
+    diagnostics = convergence_diagnostics(
+        chain,
+        log_prob,
+        np.full(4, 0.3),
+        {"rows": rows, "all_available": False, "worst_tau": 1.0, "unavailable_count": 1},
+        Phase1CConfig(convergence_ess_minimum=100.0, convergence_tau_multiple=50.0),
+        warmup_steps=1,
+        posterior_stability={"passed": True},
+        ensemble_agreement={"passed": True},
+    )
+    assert diagnostics["status"] == "nonconverged"
+    assert diagnostics["criteria"]["complete_valid_autocorrelation"] is False
+
+
+def test_autocorrelation_rule_uses_worst_case_not_median(monkeypatch):
+    rng = np.random.default_rng(12)
+    chain = rng.normal(size=(4, 120, len(PARAMETER_ORDER)))
+    log_prob = np.zeros((4, 120))
+
+    def fake_arviz(_chain):
+        return {
+            "split_rhat": {name: 1.0 for name in PARAMETER_ORDER},
+            "bulk_ess": {name: 10_000.0 for name in PARAMETER_ORDER},
+            "tail_ess": {name: 10_000.0 for name in PARAMETER_ORDER},
+        }
+
+    monkeypatch.setattr(diagnostics_module, "_arviz_diagnostics", fake_arviz)
+    rows = []
+    for ensemble in range(2):
+        for parameter in PARAMETER_ORDER:
+            tau = 1.0
+            if ensemble == 1 and parameter == PARAMETER_ORDER[-1]:
+                tau = 3.0
+            rows.append(
+                {
+                    "ensemble": ensemble,
+                    "parameter": parameter,
+                    "tau": tau,
+                    "available": True,
+                    "retained_steps": 119,
+                    "error": None,
+                }
+            )
+    diagnostics = convergence_diagnostics(
+        chain,
+        log_prob,
+        np.full(4, 0.3),
+        {"rows": rows, "all_available": True, "worst_tau": 3.0, "unavailable_count": 0},
+        Phase1CConfig(convergence_ess_minimum=100.0, convergence_tau_multiple=50.0),
+        warmup_steps=1,
+        posterior_stability={"passed": True},
+        ensemble_agreement={"passed": True},
+    )
+    assert diagnostics["status"] == "nonconverged"
+    assert diagnostics["criteria"]["complete_valid_autocorrelation"] is True
+    assert diagnostics["criteria"]["chain_length_exceeds_tau_multiple"] is False
+    assert diagnostics["autocorrelation_worst_tau"] == pytest.approx(3.0)
+
+
+def test_finite_log_probability_fraction_is_convergence_rule(monkeypatch):
+    rng = np.random.default_rng(13)
+    chain = rng.normal(size=(4, 120, len(PARAMETER_ORDER)))
+    log_prob = np.zeros((4, 120))
+    log_prob[0, 0] = -math.inf
+
+    def fake_arviz(_chain):
+        return {
+            "split_rhat": {name: 1.0 for name in PARAMETER_ORDER},
+            "bulk_ess": {name: 10_000.0 for name in PARAMETER_ORDER},
+            "tail_ess": {name: 10_000.0 for name in PARAMETER_ORDER},
+        }
+
+    monkeypatch.setattr(diagnostics_module, "_arviz_diagnostics", fake_arviz)
+    rows = [
+        {
+            "ensemble": ensemble,
+            "parameter": parameter,
+            "tau": 1.0,
+            "available": True,
+            "retained_steps": 119,
+            "error": None,
+        }
+        for ensemble in range(2)
+        for parameter in PARAMETER_ORDER
+    ]
+    diagnostics = convergence_diagnostics(
+        chain,
+        log_prob,
+        np.full(4, 0.3),
+        {"rows": rows, "all_available": True, "worst_tau": 1.0, "unavailable_count": 0},
+        Phase1CConfig(convergence_ess_minimum=100.0, convergence_tau_multiple=50.0),
+        warmup_steps=1,
+        posterior_stability={"passed": True},
+        ensemble_agreement={"passed": True},
+    )
+    assert diagnostics["status"] == "nonconverged"
+    assert diagnostics["criteria"]["finite_log_probability_fraction_is_one"] is False
 
 
 def test_convergence_requires_stable_intervals_and_ensemble_agreement(monkeypatch, tmp_path):
@@ -424,7 +554,7 @@ def test_convergence_requires_stable_intervals_and_ensemble_agreement(monkeypatc
         chain,
         np.zeros(chain.shape[:2]),
         np.full(chain.shape[0], 0.3),
-        np.full(len(PARAMETER_ORDER), 0.1),
+        _autocorr_report(ensembles=2, tau=0.1, retained_steps=19),
         config,
         warmup_steps=1,
         posterior_stability={"passed": True},
@@ -432,6 +562,43 @@ def test_convergence_requires_stable_intervals_and_ensemble_agreement(monkeypatc
     )
     assert diagnostics["status"] == "nonconverged"
     assert diagnostics["criteria"]["independent_ensemble_agreement"] is False
+
+
+def test_synthetic_run_reuses_stability_history_and_summarizes_checkpoints(tmp_path):
+    config = Phase1CConfig(
+        output_dir=tmp_path / "phase1c",
+        run_id="stable",
+        n_ensembles=2,
+        n_walkers=16,
+        synthetic_steps=6,
+        chunk_steps=2,
+        warmup_steps=1,
+        convergence_stability_chunks=3,
+        convergence_stability_sigma_threshold=1.0e9,
+    )
+    result = run_phase1c_synthetic_validation(config)
+    run_dir = Path(result["run_directory"])
+    diagnostics = json.loads((run_dir / "sampler_diagnostics.json").read_text(encoding="utf-8"))
+    history = pd.read_csv(run_dir / "convergence_history.csv")
+    run_index = json.loads((tmp_path / "phase1c" / "run_index.json").read_text(encoding="utf-8"))
+
+    assert (run_dir / "posterior_summary_history.jsonl").exists()
+    assert diagnostics["posterior_stability"]["passed"] is True
+    assert bool(history.iloc[-1]["posterior_stability_passed"]) is True
+    assert history.iloc[-1]["convergence_status"] == diagnostics["status"]
+    assert run_index["runs"][-1]["status"] == diagnostics["status"]
+
+    runtime = json.loads((run_dir / "sampler_runtime.json").read_text(encoding="utf-8"))
+    assert runtime["latest_invocation"]["status"] == "completed"
+    assert runtime["cumulative_totals"]["posterior_calls"] > 0
+    assert runtime["invocation_history_path"].endswith("invocation_history.json")
+
+    summary = summarize_phase1c_checkpoints(config, mode="synthetic")
+    assert summary["checkpoint_metadata_validated"] is True
+    assert summary["stored_log_probability_entries"] > 0
+    invocation_history = json.loads((run_dir / "invocation_history.json").read_text(encoding="utf-8"))
+    assert invocation_history["invocations"][-1]["mode"] == "synthetic_summarize"
+    assert invocation_history["invocations"][-1]["status"] == "completed"
 
 
 def test_generic_phase1c_modules_have_no_kepler5_planet_constant_imports():
@@ -445,6 +612,22 @@ def test_generic_phase1c_modules_have_no_kepler5_planet_constant_imports():
     ):
         text = (package_root / name).read_text(encoding="utf-8").upper()
         assert "KEPLER5B_" not in text
+
+
+def _autocorr_report(*, ensembles: int, tau: float, retained_steps: int):
+    rows = [
+        {
+            "ensemble": ensemble,
+            "parameter": parameter,
+            "tau": tau,
+            "available": True,
+            "retained_steps": retained_steps,
+            "error": None,
+        }
+        for ensemble in range(ensembles)
+        for parameter in PARAMETER_ORDER
+    ]
+    return {"rows": rows, "all_available": True, "worst_tau": tau, "unavailable_count": 0}
 
 
 def _write_phase1b_snapshot(tmp_path):

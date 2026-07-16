@@ -339,20 +339,46 @@ def load_backend_chains_by_ensemble(results: list[EnsembleRunResult]) -> list[np
     return chains
 
 
-def estimate_autocorrelation_time(results: list[EnsembleRunResult], warmup_steps: int) -> np.ndarray | None:
-    """Return median emcee autocorrelation-time estimates across ensembles when available."""
-    estimates = []
+def estimate_autocorrelation_time(results: list[EnsembleRunResult], warmup_steps: int) -> dict[str, Any]:
+    """Return per-ensemble integrated autocorrelation estimates for all sampled parameters."""
+    rows = []
     for result in results:
         backend = emcee.backends.HDFBackend(str(result.backend_path), read_only=True)
+        retained_steps = max(int(backend.iteration) - int(warmup_steps), 0)
+        estimate = None
+        error = None
         try:
             estimate = backend.get_autocorr_time(discard=warmup_steps, quiet=True)
-        except (emcee.autocorr.AutocorrError, ValueError, FloatingPointError, IndexError):
-            continue
-        if np.all(np.isfinite(estimate)):
-            estimates.append(estimate)
-    if not estimates:
-        return None
-    return np.nanmedian(np.asarray(estimates, dtype=float), axis=0)
+        except (emcee.autocorr.AutocorrError, ValueError, FloatingPointError, IndexError) as exc:
+            error = str(exc)
+        for parameter_index, parameter in enumerate(PARAMETER_ORDER):
+            value = None
+            available = False
+            if estimate is not None:
+                raw_value = float(np.asarray(estimate, dtype=float)[parameter_index])
+                if np.isfinite(raw_value):
+                    value = raw_value
+                    available = True
+                else:
+                    error = "nonfinite_autocorrelation_time"
+            rows.append(
+                {
+                    "ensemble": int(result.ensemble_index),
+                    "parameter": parameter,
+                    "tau": value,
+                    "available": bool(available),
+                    "retained_steps": int(retained_steps),
+                    "error": error,
+                }
+            )
+    valid = [float(row["tau"]) for row in rows if row["available"] and row["tau"] is not None]
+    unavailable = [row for row in rows if not row["available"]]
+    return {
+        "rows": rows,
+        "all_available": not unavailable and len(rows) == len(results) * len(PARAMETER_ORDER),
+        "worst_tau": max(valid) if valid else None,
+        "unavailable_count": len(unavailable),
+    }
 
 
 def aggregate_profiler_summary(profilers: list[PosteriorProfiler]) -> dict[str, Any]:
@@ -394,7 +420,6 @@ def immutable_checkpoint_identity(
         "target_total_steps",
         "additional_steps",
         "chunk_steps",
-        "warmup_steps",
         "max_pilot_seconds",
         "minimum_meaningful_summary_draws",
     ):

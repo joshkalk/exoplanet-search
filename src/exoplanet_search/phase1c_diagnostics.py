@@ -95,7 +95,7 @@ def convergence_diagnostics(
     chain: np.ndarray,
     log_prob: np.ndarray,
     acceptance_fraction: np.ndarray,
-    autocorr_time: np.ndarray | None,
+    autocorr_time: dict[str, Any] | None,
     config: Phase1CConfig,
     *,
     warmup_steps: int,
@@ -122,10 +122,15 @@ def convergence_diagnostics(
         tail_ess = arviz_diagnostics["tail_ess"]
         diagnostic_backend = "arviz"
     finite_log_prob_fraction = float(np.mean(np.isfinite(log_prob)))
-    tau = None if autocorr_time is None else [float(value) for value in np.ravel(autocorr_time)]
+    tau_rows = [] if autocorr_time is None else list(autocorr_time.get("rows", []))
+    worst_tau = None if autocorr_time is None else autocorr_time.get("worst_tau")
     tau_ok = False
-    if autocorr_time is not None and np.all(np.isfinite(autocorr_time)):
-        tau_ok = bool(kept.shape[1] > config.convergence_tau_multiple * float(np.nanmax(autocorr_time)))
+    tau_complete = bool(autocorr_time and autocorr_time.get("all_available") and worst_tau is not None)
+    if tau_complete and np.isfinite(float(worst_tau)):
+        tau_ok = all(
+            int(row.get("retained_steps", 0)) > config.convergence_tau_multiple * float(worst_tau)
+            for row in tau_rows
+        )
     rhat_values = [value for value in rhat.values() if value is not None and np.isfinite(value)]
     ess_values = [value for value in ess.values() if value is not None and np.isfinite(value)]
     tail_ess_values = [value for value in tail_ess.values() if value is not None and np.isfinite(value)]
@@ -144,19 +149,22 @@ def convergence_diagnostics(
         and all(value >= config.convergence_ess_minimum for value in ess_values),
         "tail_ess_all_above_minimum": tail_ess_complete
         and all(value >= config.convergence_ess_minimum for value in tail_ess_values),
+        "complete_valid_autocorrelation": tau_complete,
         "chain_length_exceeds_tau_multiple": tau_ok,
         "posterior_summary_stability": stability_pass,
         "independent_ensemble_agreement": ensemble_pass,
-        "finite_log_probability_fraction": finite_log_prob_fraction,
+        "finite_log_probability_fraction_is_one": finite_log_prob_fraction == 1.0,
     }
-    converged = all(value for key, value in criteria.items() if key != "finite_log_probability_fraction")
+    converged = all(criteria.values())
     return {
         "status": "converged" if converged else "nonconverged",
         "criteria": criteria,
         "split_rhat": rhat,
         "bulk_ess": ess,
         "tail_ess": tail_ess,
-        "emcee_autocorrelation_time": tau,
+        "emcee_autocorrelation_time": autocorr_time
+        or {"rows": [], "all_available": False, "worst_tau": None, "unavailable_count": len(PARAMETER_ORDER)},
+        "autocorrelation_worst_tau": None if worst_tau is None else float(worst_tau),
         "acceptance_fraction": {
             "min": float(np.min(acceptance_fraction)),
             "median": float(np.median(acceptance_fraction)),

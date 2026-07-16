@@ -123,8 +123,60 @@ def run_phase1c_synthetic_validation(
 def summarize_phase1c_checkpoints(config: Phase1CConfig, *, mode: str = "pilot") -> dict[str, Any]:
     """Summarize existing checkpoints without running additional MCMC steps."""
     run_config = prepare_run_config(config, mode, resume=True)
-    data = load_frozen_phase1b(run_config)
-    timing = build_timing_reference(data, run_config)
+    run_config = _stored_phase1c_config(run_config)
+    iterations = _stored_iterations(run_config.output_dir)
+    invocation = _begin_invocation(
+        run_config,
+        f"{mode}_summarize",
+        starting_iterations=iterations,
+        target_steps=min(iterations.values(), default=0),
+    )
+    start = time.perf_counter()
+    try:
+        data, timing = _load_summarize_data(run_config, mode)
+        _validate_synthetic_input_record_if_needed(data, timing, run_config, mode)
+        result = _summarize_phase1c_checkpoints(run_config, data, timing, mode=mode)
+    except KeyboardInterrupt:
+        _finish_invocation(
+            run_config,
+            invocation,
+            status="interrupted",
+            ending_iterations=_stored_iterations(run_config.output_dir),
+            elapsed_seconds=time.perf_counter() - start,
+            posterior_calls=0,
+            stop_reason="interrupted",
+        )
+        raise
+    except Exception:
+        _finish_invocation(
+            run_config,
+            invocation,
+            status="failed",
+            ending_iterations=_stored_iterations(run_config.output_dir),
+            elapsed_seconds=time.perf_counter() - start,
+            posterior_calls=0,
+            stop_reason="failed",
+        )
+        raise
+    _finish_invocation(
+        run_config,
+        invocation,
+        status="completed",
+        ending_iterations=_stored_iterations(run_config.output_dir),
+        elapsed_seconds=time.perf_counter() - start,
+        posterior_calls=0,
+        stop_reason="summarized_existing_checkpoints",
+    )
+    return result
+
+
+def _summarize_phase1c_checkpoints(
+    run_config: Phase1CConfig,
+    data: FrozenPhase1BData,
+    timing: TimingReference,
+    *,
+    mode: str,
+) -> dict[str, Any]:
     from .phase1c_sampler import validate_checkpoint_metadata
     import emcee
 
@@ -195,6 +247,30 @@ def prepare_run_config(config: Phase1CConfig, mode: str, *, resume: bool) -> Pha
     return replace(config, output_dir=run_dir, run_id=run_id)
 
 
+def _stored_phase1c_config(config: Phase1CConfig) -> Phase1CConfig:
+    path = config.output_dir / "phase1c_configuration.json"
+    if not path.exists():
+        return config
+    payload = _read_json(path)
+    payload.pop("parameter_order", None)
+    payload.pop("notes", None)
+    path_fields = {"phase1b_output_dir", "output_dir"}
+    tuple_fields = {
+        "rp_bounds",
+        "a_bounds",
+        "q_bounds",
+        "local_tight_scales",
+        "local_moderate_scales",
+        "local_broad_scales",
+    }
+    for key in path_fields & set(payload):
+        payload[key] = Path(payload[key])
+    for key in tuple_fields & set(payload):
+        payload[key] = tuple(payload[key])
+    stored = Phase1CConfig(**payload)
+    return replace(stored, output_dir=config.output_dir, run_id=config.run_id)
+
+
 def _target_steps(config: Phase1CConfig, default_steps: int, *, resume: bool) -> int:
     """Resolve target total steps, supporting extension by additional steps."""
     if config.additional_steps is not None and config.target_total_steps is not None:
@@ -248,30 +324,38 @@ def _begin_invocation(
     record = {
         "invocation_sequence_number": len(history) + 1,
         "timestamp_start_utc": datetime.now(UTC).isoformat(),
+        "status": "started",
         "mode": mode,
         "run_id": config.run_id,
         "starting_iterations": starting_iterations,
         "target_total_steps": int(target_steps),
+        "mutable_execution_controls": _mutable_execution_controls(config),
         "git": {"commit": _git_output("rev-parse", "HEAD"), "status": _git_output("status", "--short")},
     }
+    history.append(record)
+    write_json(config.output_dir / "invocation_history.json", {"invocations": history})
     return record
 
 
-def _end_invocation(
+def _finish_invocation(
     config: Phase1CConfig,
     record: dict[str, Any],
     *,
+    status: str,
     ending_iterations: dict[str, int],
     elapsed_seconds: float,
     posterior_calls: int,
     stop_reason: str,
 ) -> None:
     history = _read_invocation_history(config.output_dir)
-    cumulative_calls = posterior_calls + sum(int(item.get("new_posterior_calls", 0)) for item in history)
-    cumulative_runtime = elapsed_seconds + sum(float(item.get("invocation_runtime_seconds", 0.0)) for item in history)
+    sequence = int(record["invocation_sequence_number"])
+    prior = [item for item in history if int(item.get("invocation_sequence_number", -1)) != sequence]
+    cumulative_calls = posterior_calls + sum(int(item.get("new_posterior_calls", 0)) for item in prior)
+    cumulative_runtime = elapsed_seconds + sum(float(item.get("invocation_runtime_seconds", 0.0)) for item in prior)
     record.update(
         {
             "timestamp_end_utc": datetime.now(UTC).isoformat(),
+            "status": status,
             "ending_iterations": ending_iterations,
             "new_posterior_calls": int(posterior_calls),
             "invocation_runtime_seconds": float(elapsed_seconds),
@@ -280,8 +364,22 @@ def _end_invocation(
             "stop_reason": stop_reason,
         }
     )
-    history.append(record)
+    history = [record if int(item.get("invocation_sequence_number", -1)) == sequence else item for item in history]
     write_json(config.output_dir / "invocation_history.json", {"invocations": history})
+
+
+def _mutable_execution_controls(config: Phase1CConfig) -> dict[str, Any]:
+    return {
+        "pilot_steps": config.pilot_steps,
+        "synthetic_steps": config.synthetic_steps,
+        "synthetic_recovery_steps": config.synthetic_recovery_steps,
+        "production_steps": config.production_steps,
+        "target_total_steps": config.target_total_steps,
+        "additional_steps": config.additional_steps,
+        "chunk_steps": config.chunk_steps,
+        "max_pilot_seconds": config.max_pilot_seconds,
+        "minimum_meaningful_summary_draws": config.minimum_meaningful_summary_draws,
+    }
 
 
 def _read_invocation_history(output_dir: Path) -> list[dict[str, Any]]:
@@ -299,6 +397,39 @@ def _write_json_if_absent(path: Path, payload: dict[str, Any]) -> None:
         write_json(path, payload)
 
 
+def _load_summarize_data(config: Phase1CConfig, mode: str) -> tuple[FrozenPhase1BData, TimingReference]:
+    if mode in {"synthetic", "synthetic_recovery"}:
+        data, timing, _ = synthetic_dataset(config)
+        return data, timing
+    data = load_frozen_phase1b(config)
+    return data, build_timing_reference(data, config)
+
+
+def _validate_synthetic_input_record_if_needed(
+    data: FrozenPhase1BData,
+    timing: TimingReference,
+    config: Phase1CConfig,
+    mode: str,
+) -> None:
+    if mode not in {"synthetic", "synthetic_recovery"}:
+        return
+    path = config.output_dir / "synthetic_input_record.json"
+    if not path.exists():
+        raise FileNotFoundError(f"Missing synthetic input record: {path}")
+    recorded = _read_json(path)
+    expected = _synthetic_input_record(data, timing)
+    for key in ("type", "cadence_count", "event_count", "residuals_csv_used_as_input"):
+        if recorded.get(key) != expected[key]:
+            raise ValueError(f"synthetic_input_record.json mismatch for {key}.")
+    for key, value in expected["timing_reference"].items():
+        recorded_value = recorded.get("timing_reference", {}).get(key)
+        if isinstance(value, float):
+            if not np.isclose(float(recorded_value), value, rtol=0.0, atol=1.0e-12):
+                raise ValueError(f"synthetic_input_record.json timing mismatch for {key}.")
+        elif recorded_value != value:
+            raise ValueError(f"synthetic_input_record.json timing mismatch for {key}.")
+
+
 def _run_sampling_mode(
     data: FrozenPhase1BData,
     config: Phase1CConfig,
@@ -311,49 +442,86 @@ def _run_sampling_mode(
     start = time.perf_counter()
     starting_iterations = _stored_iterations(config.output_dir)
     invocation = _begin_invocation(config, mode, starting_iterations=starting_iterations, target_steps=steps)
-    audit = timing_support_audit(data, timing)
-    if not audit["center_remains_inside_every_frozen_window"]:
-        raise RuntimeError("Phase 1C timing support audit failed: centers leave frozen windows.")
-    _write_common_inputs(data, config, timing, mode=mode, timing_audit=audit, immutable=resume)
-    if mode not in {"synthetic", "synthetic_recovery"}:
-        if not resume or not (config.output_dir / "phase1b_input_manifest.json").exists():
-            write_phase1b_input_manifest(config.phase1b_output_dir, config.output_dir)
-    else:
-        writer = _write_json_if_absent if resume else write_json
-        writer(config.output_dir / "synthetic_input_record.json", _synthetic_input_record(data, timing))
+    try:
+        audit = timing_support_audit(data, timing)
+        if not audit["center_remains_inside_every_frozen_window"]:
+            raise RuntimeError("Phase 1C timing support audit failed: centers leave frozen windows.")
+        _write_common_inputs(data, config, timing, mode=mode, timing_audit=audit, immutable=resume)
+        if mode not in {"synthetic", "synthetic_recovery"}:
+            if not resume or not (config.output_dir / "phase1b_input_manifest.json").exists():
+                write_phase1b_input_manifest(config.phase1b_output_dir, config.output_dir)
+        else:
+            writer = _write_json_if_absent if resume else write_json
+            writer(config.output_dir / "synthetic_input_record.json", _synthetic_input_record(data, timing))
 
-    history_state: dict[str, Any] = {"summary_history": [], "rows": _read_existing_history(config.output_dir)}
+        history_state: dict[str, Any] = {
+            "summary_history": _read_posterior_summary_history(config.output_dir),
+            "rows": _read_existing_history(config.output_dir),
+        }
 
-    def on_chunk(results, elapsed_seconds, profiler_summary):
-        _append_convergence_history(
+        def on_chunk(results, elapsed_seconds, profiler_summary):
+            _append_convergence_history(
+                config,
+                timing,
+                results,
+                mode=mode,
+                elapsed_seconds=elapsed_seconds,
+                profiler_summary=profiler_summary,
+                history_state=history_state,
+            )
+
+        results = run_ensembles(
+            data,
+            config,
+            timing,
+            steps=steps,
+            mode=mode,
+            resume=resume,
+            chunk_callback=on_chunk,
+        )
+        elapsed = time.perf_counter() - start
+        summary = _write_sampling_summaries(
+            data,
             config,
             timing,
             results,
             mode=mode,
-            elapsed_seconds=elapsed_seconds,
-            profiler_summary=profiler_summary,
-            history_state=history_state,
+            elapsed_seconds=elapsed,
+            summary_history=history_state["summary_history"],
+            latest_invocation=invocation,
         )
-
-    results = run_ensembles(
-        data,
-        config,
-        timing,
-        steps=steps,
-        mode=mode,
-        resume=resume,
-        chunk_callback=on_chunk,
-    )
-    elapsed = time.perf_counter() - start
-    summary = _write_sampling_summaries(data, config, timing, results, mode=mode, elapsed_seconds=elapsed)
-    _end_invocation(
+    except KeyboardInterrupt:
+        _finish_invocation(
+            config,
+            invocation,
+            status="interrupted",
+            ending_iterations=_stored_iterations(config.output_dir),
+            elapsed_seconds=time.perf_counter() - start,
+            posterior_calls=0,
+            stop_reason="interrupted",
+        )
+        raise
+    except Exception:
+        _finish_invocation(
+            config,
+            invocation,
+            status="failed",
+            ending_iterations=_stored_iterations(config.output_dir),
+            elapsed_seconds=time.perf_counter() - start,
+            posterior_calls=0,
+            stop_reason="failed",
+        )
+        raise
+    _finish_invocation(
         config,
         invocation,
+        status="completed",
         ending_iterations=_stored_iterations(config.output_dir),
-        elapsed_seconds=elapsed,
+        elapsed_seconds=summary["elapsed_seconds"],
         posterior_calls=summary["actual_log_posterior_calls"],
         stop_reason="target_steps_reached",
     )
+    _rewrite_runtime_with_finished_invocation(config)
     update_run_index(config.output_dir.parent, config, mode, summary["diagnostic_status"])
     return summary
 
@@ -382,6 +550,8 @@ def _write_sampling_summaries(
     *,
     mode: str,
     elapsed_seconds: float,
+    summary_history: list[pd.DataFrame],
+    latest_invocation: dict[str, Any],
 ) -> dict[str, Any]:
     diagnostic_start = time.perf_counter()
     chain, log_prob = load_backend_chains(results)
@@ -390,7 +560,8 @@ def _write_sampling_summaries(
     autocorr = estimate_autocorrelation_time(results, config.warmup_steps)
     posterior = posterior_summary_frame(chain, timing, warmup_steps=config.warmup_steps)
     ensemble = ensemble_summary_frame(chains_by_ensemble, config.warmup_steps)
-    stability = posterior_stability_check([posterior], config)
+    history_for_diagnostics = summary_history if summary_history else [posterior]
+    stability = posterior_stability_check(history_for_diagnostics, config)
     agreement = independent_ensemble_agreement(chains_by_ensemble, timing, config, warmup_steps=config.warmup_steps)
     diagnostics = convergence_diagnostics(
         chain,
@@ -415,22 +586,31 @@ def _write_sampling_summaries(
     write_json(config.output_dir / "sampler_diagnostics.json", diagnostics)
     profiler_summary = _aggregate_result_profilers(results)
     output_overhead = max(elapsed_seconds - float(profiler_summary.get("total_log_posterior_seconds", 0.0)), 0.0)
+    invocation_calls = int(profiler_summary.get("posterior_calls", 0))
     runtime = {
         "mode": mode,
         "run_id": config.run_id,
-        "elapsed_seconds": elapsed_seconds,
+        "cumulative_totals": _cumulative_runtime_totals(
+            config.output_dir,
+            pending_calls=invocation_calls,
+            pending_elapsed_seconds=elapsed_seconds,
+        ),
+        "latest_invocation": {
+            **latest_invocation,
+            "elapsed_seconds_so_far": float(elapsed_seconds),
+            "posterior_calls_this_invocation": invocation_calls,
+            "posterior_calls_per_second": float(invocation_calls / elapsed_seconds) if elapsed_seconds > 0.0 else None,
+            "stored_draws_per_second": float(np.size(log_prob) / elapsed_seconds) if elapsed_seconds > 0.0 else None,
+            "timing_seconds": {
+                **profiler_summary,
+                "output_and_diagnostic_overhead_seconds": output_overhead + (time.perf_counter() - diagnostic_start),
+            },
+        },
+        "invocation_history_path": str(config.output_dir / "invocation_history.json"),
+        "invocation_history": _read_invocation_history(config.output_dir),
         "total_iterations_per_ensemble": [result.iterations for result in results],
         "stored_log_probability_entries": int(np.size(log_prob)),
         "finite_log_probability_fraction": float(np.mean(np.isfinite(log_prob))),
-        "actual_log_posterior_calls": int(profiler_summary.get("posterior_calls", 0)),
-        "posterior_calls_per_second": (
-            float(profiler_summary.get("posterior_calls", 0) / elapsed_seconds) if elapsed_seconds > 0.0 else None
-        ),
-        "stored_draws_per_second": float(np.size(log_prob) / elapsed_seconds) if elapsed_seconds > 0.0 else None,
-        "timing_seconds": {
-            **profiler_summary,
-            "output_and_diagnostic_overhead_seconds": output_overhead + (time.perf_counter() - diagnostic_start),
-        },
         "ensemble_results": [_ensemble_runtime_row(result) for result in results],
     }
     write_json(config.output_dir / "sampler_runtime.json", runtime)
@@ -469,8 +649,8 @@ def _write_sampling_summaries(
         "diagnostic_status": diagnostics["status"],
         "nonproduction": mode in {"pilot", "synthetic", "synthetic_recovery"},
         "elapsed_seconds": elapsed_seconds,
-        "actual_log_posterior_calls": int(profiler_summary.get("posterior_calls", 0)),
-        "posterior_calls_per_second": runtime["posterior_calls_per_second"],
+        "actual_log_posterior_calls": invocation_calls,
+        "posterior_calls_per_second": runtime["latest_invocation"]["posterior_calls_per_second"],
         "finite_log_probability_fraction": diagnostics["finite_log_probability_fraction"],
         "acceptance_fraction": diagnostics["acceptance_fraction"],
     }
@@ -493,6 +673,16 @@ def _append_convergence_history(
     try:
         summary = posterior_summary_frame(chain, timing, warmup_steps=config.warmup_steps)
         history_state["summary_history"].append(summary)
+        _append_posterior_summary_history(
+            config.output_dir,
+            {
+                "mode": mode,
+                "run_id": config.run_id,
+                "completed_steps": int(min(result.iterations for result in results)),
+                "timestamp_utc": datetime.now(UTC).isoformat(),
+                "summary": summary.to_dict(orient="records"),
+            },
+        )
     except (ValueError, IndexError):
         pass
     chains_by_ensemble = load_backend_chains_by_ensemble(results)
@@ -525,9 +715,10 @@ def _append_convergence_history(
         "rhat_max": _max_numeric(diagnostics["split_rhat"]),
         "bulk_ess_min": _min_numeric(diagnostics["bulk_ess"]),
         "tail_ess_min": _min_numeric(diagnostics["tail_ess"]),
-        "autocorrelation_time_max": None
-        if diagnostics["emcee_autocorrelation_time"] is None
-        else _max_list(diagnostics["emcee_autocorrelation_time"]),
+        "autocorrelation_time_max": diagnostics["autocorrelation_worst_tau"],
+        "complete_valid_autocorrelation": diagnostics["criteria"]["complete_valid_autocorrelation"],
+        "chain_length_exceeds_tau_multiple": diagnostics["criteria"]["chain_length_exceeds_tau_multiple"],
+        "finite_log_probability_fraction_is_one": diagnostics["criteria"]["finite_log_probability_fraction_is_one"],
         "diagnostic_backend": diagnostics["standard_diagnostic_backend"],
         "diagnostic_availability": diagnostics["standard_diagnostic_backend"],
         "posterior_stability_passed": stability["passed"],
@@ -877,6 +1068,69 @@ def _read_existing_history(output_dir: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     return pd.read_csv(path).to_dict(orient="records")
+
+
+def _posterior_summary_history_path(output_dir: Path) -> Path:
+    return output_dir / "posterior_summary_history.jsonl"
+
+
+def _append_posterior_summary_history(output_dir: Path, record: dict[str, Any]) -> None:
+    path = _posterior_summary_history_path(output_dir)
+    with path.open("a", encoding="utf-8") as output_file:
+        output_file.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+
+
+def _read_posterior_summary_history(output_dir: Path) -> list[pd.DataFrame]:
+    path = _posterior_summary_history_path(output_dir)
+    if not path.exists():
+        return []
+    frames = []
+    with path.open("r", encoding="utf-8") as input_file:
+        for line in input_file:
+            if not line.strip():
+                continue
+            payload = json.loads(line)
+            frames.append(pd.DataFrame(payload["summary"]))
+    return frames
+
+
+def _cumulative_runtime_totals(
+    output_dir: Path,
+    *,
+    pending_calls: int = 0,
+    pending_elapsed_seconds: float = 0.0,
+) -> dict[str, Any]:
+    history = _read_invocation_history(output_dir)
+    completed = [item for item in history if item.get("status") == "completed"]
+    return {
+        "posterior_calls": int(pending_calls + sum(int(item.get("new_posterior_calls", 0)) for item in completed)),
+        "sampling_runtime_seconds": float(
+            pending_elapsed_seconds + sum(float(item.get("invocation_runtime_seconds", 0.0)) for item in completed)
+        ),
+        "completed_invocation_count": len(completed),
+        "invocation_count": len(history),
+    }
+
+
+def _rewrite_runtime_with_finished_invocation(config: Phase1CConfig) -> None:
+    path = config.output_dir / "sampler_runtime.json"
+    if not path.exists():
+        return
+    runtime = _read_json(path)
+    history = _read_invocation_history(config.output_dir)
+    latest = next(
+        (
+            item
+            for item in history
+            if int(item.get("invocation_sequence_number", -1))
+            == int(runtime.get("latest_invocation", {}).get("invocation_sequence_number", -2))
+        ),
+        runtime.get("latest_invocation", {}),
+    )
+    runtime["latest_invocation"] = latest
+    runtime["invocation_history"] = history
+    runtime["cumulative_totals"] = _cumulative_runtime_totals(config.output_dir)
+    write_json(path, runtime)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
