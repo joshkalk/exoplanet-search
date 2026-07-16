@@ -18,8 +18,10 @@ from .phase1b_model import batman_flux
 from .phase1c_diagnostics import (
     convergence_diagnostics,
     ensemble_summary_frame,
+    independent_ensemble_agreement,
     post_warmup_flat_chain,
     post_warmup_chain,
+    posterior_stability_check,
     posterior_summary_frame,
 )
 from .phase1c_inputs import load_frozen_phase1b, write_phase1b_input_manifest
@@ -75,7 +77,14 @@ def run_phase1c_pilot(config: Phase1CConfig, *, resume: bool = False) -> dict[st
     run_config = prepare_run_config(config, "pilot", resume=resume)
     data = load_frozen_phase1b(run_config)
     timing = build_timing_reference(data, run_config)
-    return _run_sampling_mode(data, run_config, timing, mode="pilot", steps=run_config.pilot_steps, resume=resume)
+    return _run_sampling_mode(
+        data,
+        run_config,
+        timing,
+        mode="pilot",
+        steps=_target_steps(run_config, run_config.pilot_steps, resume=resume),
+        resume=resume,
+    )
 
 
 def run_phase1c_production(config: Phase1CConfig, *, resume: bool = False) -> dict[str, Any]:
@@ -88,7 +97,7 @@ def run_phase1c_production(config: Phase1CConfig, *, resume: bool = False) -> di
         run_config,
         timing,
         mode="production",
-        steps=run_config.production_steps,
+        steps=_target_steps(run_config, run_config.production_steps, resume=resume),
         resume=resume,
     )
 
@@ -103,11 +112,11 @@ def run_phase1c_synthetic_validation(
     mode = "synthetic_recovery" if recovery else "synthetic"
     run_config = prepare_run_config(config, mode, resume=resume)
     data, timing, injected = synthetic_dataset(run_config)
-    steps = run_config.synthetic_recovery_steps if recovery else run_config.synthetic_steps
+    default_steps = run_config.synthetic_recovery_steps if recovery else run_config.synthetic_steps
+    steps = _target_steps(run_config, default_steps, resume=resume)
     result = _run_sampling_mode(data, run_config, timing, mode=mode, steps=steps, resume=resume)
     payload = _synthetic_summary(run_config, timing, injected, result, recovery=recovery)
     write_json(run_config.output_dir / "synthetic_recovery_summary.json", payload)
-    update_run_index(config.output_dir, run_config, mode, payload["status"])
     return payload
 
 
@@ -116,28 +125,56 @@ def summarize_phase1c_checkpoints(config: Phase1CConfig, *, mode: str = "pilot")
     run_config = prepare_run_config(config, mode, resume=True)
     data = load_frozen_phase1b(run_config)
     timing = build_timing_reference(data, run_config)
-    results = []
-    from .phase1c_sampler import EnsembleRunResult
+    from .phase1c_sampler import validate_checkpoint_metadata
+    import emcee
 
+    metadata = checkpoint_metadata(data, run_config, mode=mode)
+    rows = []
     for ensemble_index in range(run_config.n_ensembles):
         path = run_config.output_dir / f"ensemble_{ensemble_index:02d}.h5"
-        if path.exists():
-            results.append(
-                EnsembleRunResult(
-                    ensemble_index=ensemble_index,
-                    seed=run_config.random_seed + 1000 * ensemble_index,
-                    strategy="checkpoint",
-                    backend_path=path,
-                    iterations=0,
-                    runtime_seconds=0.0,
-                    acceptance_fraction=np.asarray([np.nan]),
-                    initialization_summary={"resume": True},
-                    profiler_summary={},
-                )
-            )
-    if not results:
+        if not path.exists():
+            continue
+        validate_checkpoint_metadata(path, metadata, run_config.random_seed + 1000 * ensemble_index)
+        backend = emcee.backends.HDFBackend(str(path), read_only=True)
+        accepted = np.asarray(getattr(backend, "accepted", np.asarray([], dtype=float)), dtype=float)
+        rows.append(
+            {
+                "ensemble": ensemble_index,
+                "path": str(path),
+                "iterations": int(backend.iteration),
+                "accepted_min": float(np.min(accepted)) if accepted.size else None,
+                "accepted_median": float(np.median(accepted)) if accepted.size else None,
+                "accepted_max": float(np.max(accepted)) if accepted.size else None,
+            }
+        )
+    if not rows:
         raise FileNotFoundError(f"No Phase 1C {mode!r} checkpoints found in {run_config.output_dir}.")
-    return _write_sampling_summaries(data, run_config, timing, results, mode=mode, elapsed_seconds=0.0)
+    chain_parts = []
+    log_prob_parts = []
+    for row in rows:
+        backend = emcee.backends.HDFBackend(row["path"], read_only=True)
+        chain_parts.append(np.transpose(backend.get_chain(), (1, 0, 2)))
+        log_prob_parts.append(np.transpose(backend.get_log_prob(), (1, 0)))
+    chain = np.concatenate(chain_parts, axis=0)
+    log_prob = np.concatenate(log_prob_parts, axis=0)
+    summary = posterior_summary_frame(chain, timing, warmup_steps=run_config.warmup_steps)
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    summary_path = run_config.output_dir / f"checkpoint_summary_{timestamp}.csv"
+    summary.to_csv(summary_path, index=False)
+    payload = {
+        "mode": mode,
+        "run_id": run_config.run_id,
+        "run_directory": str(run_config.output_dir),
+        "checkpoint_metadata_validated": True,
+        "stored_log_probability_entries": int(np.size(log_prob)),
+        "finite_log_probability_fraction": float(np.mean(np.isfinite(log_prob))),
+        "ensembles": rows,
+        "summary_path": str(summary_path),
+        "authoritative_runtime_modified": False,
+        "authoritative_provenance_modified": False,
+    }
+    write_json(run_config.output_dir / f"checkpoint_summary_{timestamp}.json", payload)
+    return payload
 
 
 def prepare_run_config(config: Phase1CConfig, mode: str, *, resume: bool) -> Phase1CConfig:
@@ -158,6 +195,24 @@ def prepare_run_config(config: Phase1CConfig, mode: str, *, resume: bool) -> Pha
     return replace(config, output_dir=run_dir, run_id=run_id)
 
 
+def _target_steps(config: Phase1CConfig, default_steps: int, *, resume: bool) -> int:
+    """Resolve target total steps, supporting extension by additional steps."""
+    if config.additional_steps is not None and config.target_total_steps is not None:
+        raise ValueError("Use either --phase1c-additional-steps or --phase1c-target-total-steps, not both.")
+    current = min(_stored_iterations(config.output_dir).values(), default=0)
+    if config.additional_steps is not None:
+        if not resume:
+            raise ValueError("--phase1c-additional-steps requires --phase1c-resume.")
+        if config.additional_steps <= 0:
+            raise ValueError("--phase1c-additional-steps must be positive.")
+        return int(current + config.additional_steps)
+    if config.target_total_steps is not None:
+        if config.target_total_steps < current:
+            raise ValueError("Requested target total steps is below the stored checkpoint length.")
+        return int(config.target_total_steps)
+    return int(default_steps)
+
+
 def sanitize_run_id(run_id: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_id.strip())
     if not cleaned:
@@ -167,6 +222,81 @@ def sanitize_run_id(run_id: str) -> str:
 
 def timestamp_run_id() -> str:
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _stored_iterations(output_dir: Path) -> dict[str, int]:
+    import emcee
+
+    iterations = {}
+    for path in sorted(output_dir.glob("ensemble_*.h5")):
+        try:
+            backend = emcee.backends.HDFBackend(str(path), read_only=True)
+            iterations[path.name] = int(backend.iteration)
+        except (OSError, AttributeError):
+            continue
+    return iterations
+
+
+def _begin_invocation(
+    config: Phase1CConfig,
+    mode: str,
+    *,
+    starting_iterations: dict[str, int],
+    target_steps: int,
+) -> dict[str, Any]:
+    history = _read_invocation_history(config.output_dir)
+    record = {
+        "invocation_sequence_number": len(history) + 1,
+        "timestamp_start_utc": datetime.now(UTC).isoformat(),
+        "mode": mode,
+        "run_id": config.run_id,
+        "starting_iterations": starting_iterations,
+        "target_total_steps": int(target_steps),
+        "git": {"commit": _git_output("rev-parse", "HEAD"), "status": _git_output("status", "--short")},
+    }
+    return record
+
+
+def _end_invocation(
+    config: Phase1CConfig,
+    record: dict[str, Any],
+    *,
+    ending_iterations: dict[str, int],
+    elapsed_seconds: float,
+    posterior_calls: int,
+    stop_reason: str,
+) -> None:
+    history = _read_invocation_history(config.output_dir)
+    cumulative_calls = posterior_calls + sum(int(item.get("new_posterior_calls", 0)) for item in history)
+    cumulative_runtime = elapsed_seconds + sum(float(item.get("invocation_runtime_seconds", 0.0)) for item in history)
+    record.update(
+        {
+            "timestamp_end_utc": datetime.now(UTC).isoformat(),
+            "ending_iterations": ending_iterations,
+            "new_posterior_calls": int(posterior_calls),
+            "invocation_runtime_seconds": float(elapsed_seconds),
+            "cumulative_posterior_calls": int(cumulative_calls),
+            "cumulative_sampling_runtime_seconds": float(cumulative_runtime),
+            "stop_reason": stop_reason,
+        }
+    )
+    history.append(record)
+    write_json(config.output_dir / "invocation_history.json", {"invocations": history})
+
+
+def _read_invocation_history(output_dir: Path) -> list[dict[str, Any]]:
+    path = output_dir / "invocation_history.json"
+    if not path.exists():
+        return []
+    try:
+        return json.loads(path.read_text(encoding="utf-8")).get("invocations", [])
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def _write_json_if_absent(path: Path, payload: dict[str, Any]) -> None:
+    if not path.exists():
+        write_json(path, payload)
 
 
 def _run_sampling_mode(
@@ -179,16 +309,20 @@ def _run_sampling_mode(
     resume: bool,
 ) -> dict[str, Any]:
     start = time.perf_counter()
+    starting_iterations = _stored_iterations(config.output_dir)
+    invocation = _begin_invocation(config, mode, starting_iterations=starting_iterations, target_steps=steps)
     audit = timing_support_audit(data, timing)
     if not audit["center_remains_inside_every_frozen_window"]:
         raise RuntimeError("Phase 1C timing support audit failed: centers leave frozen windows.")
-    _write_common_inputs(data, config, timing, mode=mode, timing_audit=audit)
+    _write_common_inputs(data, config, timing, mode=mode, timing_audit=audit, immutable=resume)
     if mode not in {"synthetic", "synthetic_recovery"}:
-        write_phase1b_input_manifest(config.phase1b_output_dir, config.output_dir)
+        if not resume or not (config.output_dir / "phase1b_input_manifest.json").exists():
+            write_phase1b_input_manifest(config.phase1b_output_dir, config.output_dir)
     else:
-        write_json(config.output_dir / "synthetic_input_record.json", _synthetic_input_record(data, timing))
+        writer = _write_json_if_absent if resume else write_json
+        writer(config.output_dir / "synthetic_input_record.json", _synthetic_input_record(data, timing))
 
-    history_state: dict[str, Any] = {"previous_medians": None, "rows": _read_existing_history(config.output_dir)}
+    history_state: dict[str, Any] = {"summary_history": [], "rows": _read_existing_history(config.output_dir)}
 
     def on_chunk(results, elapsed_seconds, profiler_summary):
         _append_convergence_history(
@@ -212,6 +346,14 @@ def _run_sampling_mode(
     )
     elapsed = time.perf_counter() - start
     summary = _write_sampling_summaries(data, config, timing, results, mode=mode, elapsed_seconds=elapsed)
+    _end_invocation(
+        config,
+        invocation,
+        ending_iterations=_stored_iterations(config.output_dir),
+        elapsed_seconds=elapsed,
+        posterior_calls=summary["actual_log_posterior_calls"],
+        stop_reason="target_steps_reached",
+    )
     update_run_index(config.output_dir.parent, config, mode, summary["diagnostic_status"])
     return summary
 
@@ -223,11 +365,13 @@ def _write_common_inputs(
     *,
     mode: str,
     timing_audit: dict[str, Any],
+    immutable: bool = False,
 ) -> None:
-    write_json(config.output_dir / "phase1c_configuration.json", config.to_dict())
-    write_json(config.output_dir / "parameter_transformations.json", prior_description(data, config, timing))
-    write_json(config.output_dir / "timing_support_audit.json", timing_audit)
-    write_json(config.output_dir / "provenance_manifest.json", build_phase1c_provenance(data, config, timing, mode=mode))
+    writer = _write_json_if_absent if immutable else write_json
+    writer(config.output_dir / "phase1c_configuration.json", config.to_dict())
+    writer(config.output_dir / "parameter_transformations.json", prior_description(data, config, timing))
+    writer(config.output_dir / "timing_support_audit.json", timing_audit)
+    writer(config.output_dir / "provenance_manifest.json", build_phase1c_provenance(data, config, timing, mode=mode))
 
 
 def _write_sampling_summaries(
@@ -244,6 +388,10 @@ def _write_sampling_summaries(
     chains_by_ensemble = load_backend_chains_by_ensemble(results)
     acceptance = np.concatenate([result.acceptance_fraction for result in results])
     autocorr = estimate_autocorrelation_time(results, config.warmup_steps)
+    posterior = posterior_summary_frame(chain, timing, warmup_steps=config.warmup_steps)
+    ensemble = ensemble_summary_frame(chains_by_ensemble, config.warmup_steps)
+    stability = posterior_stability_check([posterior], config)
+    agreement = independent_ensemble_agreement(chains_by_ensemble, timing, config, warmup_steps=config.warmup_steps)
     diagnostics = convergence_diagnostics(
         chain,
         log_prob,
@@ -251,9 +399,9 @@ def _write_sampling_summaries(
         autocorr,
         config,
         warmup_steps=config.warmup_steps,
+        posterior_stability=stability,
+        ensemble_agreement=agreement,
     )
-    posterior = posterior_summary_frame(chain, timing, warmup_steps=config.warmup_steps)
-    ensemble = ensemble_summary_frame(chains_by_ensemble, config.warmup_steps)
     posterior.to_csv(config.output_dir / "posterior_parameter_summary.csv", index=False)
     ensemble.to_csv(config.output_dir / "ensemble_summary.csv", index=False)
     diagnostics["mode"] = mode
@@ -341,6 +489,15 @@ def _append_convergence_history(
     chain, log_prob = load_backend_chains(results)
     acceptance = np.concatenate([result.acceptance_fraction for result in results])
     autocorr = estimate_autocorrelation_time(results, config.warmup_steps)
+    summary = None
+    try:
+        summary = posterior_summary_frame(chain, timing, warmup_steps=config.warmup_steps)
+        history_state["summary_history"].append(summary)
+    except (ValueError, IndexError):
+        pass
+    chains_by_ensemble = load_backend_chains_by_ensemble(results)
+    stability = posterior_stability_check(history_state["summary_history"], config)
+    agreement = independent_ensemble_agreement(chains_by_ensemble, timing, config, warmup_steps=config.warmup_steps)
     diagnostics = convergence_diagnostics(
         chain,
         log_prob,
@@ -348,11 +505,12 @@ def _append_convergence_history(
         autocorr,
         config,
         warmup_steps=config.warmup_steps,
+        posterior_stability=stability,
+        ensemble_agreement=agreement,
     )
     kept = post_warmup_chain(chain, config.warmup_steps)
     completed_steps = int(min(result.iterations for result in results))
     retained_steps = int(kept.shape[1])
-    stability = _posterior_stability_metric(chain, timing, config, history_state)
     row = {
         "mode": mode,
         "run_id": config.run_id,
@@ -372,7 +530,8 @@ def _append_convergence_history(
         else _max_list(diagnostics["emcee_autocorrelation_time"]),
         "diagnostic_backend": diagnostics["standard_diagnostic_backend"],
         "diagnostic_availability": diagnostics["standard_diagnostic_backend"],
-        "posterior_median_max_abs_change_from_previous": stability,
+        "posterior_stability_passed": stability["passed"],
+        "independent_ensemble_agreement_passed": agreement["passed"],
         "convergence_status": diagnostics["status"],
     }
     history_state["rows"].append(row)
@@ -516,15 +675,19 @@ def update_run_index(base_output_dir: Path, config: Phase1CConfig, mode: str, st
             payload = []
     else:
         payload = []
-    payload.append(
-        {
-            "timestamp_utc": datetime.now(UTC).isoformat(),
-            "mode": mode,
-            "run_id": config.run_id,
-            "run_directory": str(config.output_dir),
-            "status": status,
-        }
-    )
+    entry = {
+        "timestamp_utc": datetime.now(UTC).isoformat(),
+        "mode": mode,
+        "run_id": config.run_id,
+        "run_directory": str(config.output_dir),
+        "status": status,
+    }
+    payload = [
+        item
+        for item in payload
+        if not (item.get("mode") == mode and item.get("run_id") == config.run_id)
+    ]
+    payload.append(entry)
     write_json(index_path, {"runs": payload})
 
 
@@ -587,7 +750,7 @@ def _synthetic_summary(
             else "Converged synthetic recovery status is determined by configured convergence criteria."
         ),
         "sampler_result": sampler_result,
-        "nonproduction": not recovery,
+        "nonproduction": True,
         "timing_reference": timing.__dict__,
     }
 

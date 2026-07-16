@@ -99,6 +99,8 @@ def convergence_diagnostics(
     config: Phase1CConfig,
     *,
     warmup_steps: int,
+    posterior_stability: dict[str, Any] | None = None,
+    ensemble_agreement: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return machine-readable convergence diagnostics for a combined run."""
     kept = post_warmup_chain(chain, warmup_steps)
@@ -127,14 +129,24 @@ def convergence_diagnostics(
     rhat_values = [value for value in rhat.values() if value is not None and np.isfinite(value)]
     ess_values = [value for value in ess.values() if value is not None and np.isfinite(value)]
     tail_ess_values = [value for value in tail_ess.values() if value is not None and np.isfinite(value)]
+    rhat_complete = len(rhat_values) == len(PARAMETER_ORDER)
+    ess_complete = len(ess_values) == len(PARAMETER_ORDER)
+    tail_ess_complete = len(tail_ess_values) == len(PARAMETER_ORDER)
+    stability_pass = bool(posterior_stability and posterior_stability.get("passed"))
+    ensemble_pass = bool(ensemble_agreement and ensemble_agreement.get("passed"))
     criteria = {
-        "rhat_all_below_threshold": bool(rhat_values)
+        "complete_valid_rhat": rhat_complete,
+        "complete_valid_bulk_ess": ess_complete,
+        "complete_valid_tail_ess": tail_ess_complete,
+        "rhat_all_below_threshold": rhat_complete
         and all(value < config.convergence_rhat_threshold for value in rhat_values),
-        "ess_all_above_minimum": bool(ess_values)
+        "ess_all_above_minimum": ess_complete
         and all(value >= config.convergence_ess_minimum for value in ess_values),
-        "tail_ess_all_above_minimum": bool(tail_ess_values)
+        "tail_ess_all_above_minimum": tail_ess_complete
         and all(value >= config.convergence_ess_minimum for value in tail_ess_values),
         "chain_length_exceeds_tau_multiple": tau_ok,
+        "posterior_summary_stability": stability_pass,
+        "independent_ensemble_agreement": ensemble_pass,
         "finite_log_probability_fraction": finite_log_prob_fraction,
     }
     converged = all(value for key, value in criteria.items() if key != "finite_log_probability_fraction")
@@ -153,6 +165,8 @@ def convergence_diagnostics(
         "finite_log_probability_fraction": finite_log_prob_fraction,
         "warmup_steps_excluded": int(warmup_steps),
         "standard_diagnostic_backend": diagnostic_backend,
+        "posterior_stability": posterior_stability or {"passed": False, "reason": "not_evaluated"},
+        "independent_ensemble_agreement": ensemble_agreement or {"passed": False, "reason": "not_evaluated"},
         "diagnostic_note": (
             "emcee walkers are treated as diagnostic chains for split R-hat/ESS; "
             "independent ensemble summaries are also recorded."
@@ -174,6 +188,103 @@ def ensemble_summary_frame(chain_by_ensemble: list[np.ndarray], warmup_steps: in
     return pd.DataFrame(rows)
 
 
+def posterior_stability_check(
+    summary_history: list[pd.DataFrame],
+    config: Phase1CConfig,
+) -> dict[str, Any]:
+    """Check stability of medians and interval endpoints over final monitoring chunks."""
+    if len(summary_history) < config.convergence_stability_chunks:
+        return {"passed": False, "reason": "insufficient_history", "chunks_available": len(summary_history)}
+    recent = summary_history[-config.convergence_stability_chunks :]
+    failures = []
+    parameters = set(recent[-1]["parameter"])
+    fields = ("median", "q16", "q84", "q02_5", "q97_5")
+    for parameter in sorted(parameters):
+        latest_row = recent[-1][recent[-1]["parameter"] == parameter]
+        if latest_row.empty:
+            failures.append({"parameter": parameter, "reason": "missing_latest"})
+            continue
+        latest = latest_row.iloc[0]
+        scale = max(float(abs(latest["q84"] - latest["q16"])), float(latest.get("sd", 0.0)), 1.0e-12)
+        for frame in recent[:-1]:
+            row = frame[frame["parameter"] == parameter]
+            if row.empty:
+                failures.append({"parameter": parameter, "reason": "missing_history"})
+                continue
+            previous = row.iloc[0]
+            for field in fields:
+                standardized_change = abs(float(latest[field]) - float(previous[field])) / scale
+                if standardized_change > config.convergence_stability_sigma_threshold:
+                    failures.append(
+                        {
+                            "parameter": parameter,
+                            "field": field,
+                            "standardized_change": float(standardized_change),
+                        }
+                    )
+    return {
+        "passed": not failures,
+        "failures": failures,
+        "chunks_evaluated": len(recent),
+        "threshold": config.convergence_stability_sigma_threshold,
+    }
+
+
+def independent_ensemble_agreement(
+    chain_by_ensemble: list[np.ndarray],
+    timing: TimingReference,
+    config: Phase1CConfig,
+    *,
+    warmup_steps: int,
+) -> dict[str, Any]:
+    """Check independent ensembles for shifted or poorly overlapping populations."""
+    if len(chain_by_ensemble) < 2:
+        return {"passed": False, "reason": "fewer_than_two_ensembles"}
+    summaries = [
+        posterior_summary_frame(chain, timing, warmup_steps=warmup_steps)
+        for chain in chain_by_ensemble
+    ]
+    combined = posterior_summary_frame(np.concatenate(chain_by_ensemble, axis=0), timing, warmup_steps=warmup_steps)
+    failures = []
+    for _, combined_row in combined.iterrows():
+        parameter = combined_row["parameter"]
+        scale = max(float(combined_row["q84"] - combined_row["q16"]), float(combined_row["sd"]), 1.0e-12)
+        combined_median = float(combined_row["median"])
+        for ensemble_index, summary in enumerate(summaries):
+            row = summary[summary["parameter"] == parameter].iloc[0]
+            shift = abs(float(row["median"]) - combined_median) / scale
+            overlap = _interval_overlap_fraction(
+                float(row["q16"]),
+                float(row["q84"]),
+                float(combined_row["q16"]),
+                float(combined_row["q84"]),
+            )
+            if shift > config.convergence_ensemble_shift_threshold:
+                failures.append(
+                    {
+                        "ensemble": ensemble_index,
+                        "parameter": parameter,
+                        "reason": "median_shift",
+                        "standardized_shift": float(shift),
+                    }
+                )
+            if overlap < config.convergence_interval_overlap_minimum:
+                failures.append(
+                    {
+                        "ensemble": ensemble_index,
+                        "parameter": parameter,
+                        "reason": "interval_overlap",
+                        "overlap_fraction": float(overlap),
+                    }
+                )
+    return {
+        "passed": not failures,
+        "failures": failures,
+        "median_shift_threshold": config.convergence_ensemble_shift_threshold,
+        "interval_overlap_minimum": config.convergence_interval_overlap_minimum,
+    }
+
+
 def _split_chain(chain: np.ndarray) -> np.ndarray:
     chains, draws, ndim = chain.shape
     even_draws = draws - draws % 2
@@ -182,6 +293,12 @@ def _split_chain(chain: np.ndarray) -> np.ndarray:
     first = chain[:, : even_draws // 2, :]
     second = chain[:, even_draws // 2 : even_draws, :]
     return np.concatenate([first, second], axis=0).reshape((2 * chains, even_draws // 2, ndim))
+
+
+def _interval_overlap_fraction(a_low: float, a_high: float, b_low: float, b_high: float) -> float:
+    width = max(min(a_high, b_high) - max(a_low, b_low), 0.0)
+    denominator = max(min(a_high - a_low, b_high - b_low), 1.0e-12)
+    return float(width / denominator)
 
 
 def _rhat_1d(values: np.ndarray) -> float:

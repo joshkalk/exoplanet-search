@@ -7,13 +7,20 @@ import pandas as pd
 import pytest
 
 from exoplanet_search.phase1c import prepare_run_config, synthetic_dataset
-from exoplanet_search.phase1c_diagnostics import convergence_diagnostics, posterior_summary_frame
+from exoplanet_search import phase1c_diagnostics as diagnostics_module
+from exoplanet_search.phase1c_diagnostics import (
+    convergence_diagnostics,
+    independent_ensemble_agreement,
+    posterior_stability_check,
+    posterior_summary_frame,
+)
 from exoplanet_search.phase1c_inputs import build_phase1b_input_manifest, load_frozen_phase1b
 from exoplanet_search.phase1c_likelihood import (
     log_likelihood,
     marginalized_event_log_likelihood,
 )
 from exoplanet_search.phase1c_parameters import (
+    bounded_half_normal_logpdf,
     half_normal_logpdf,
     log_prior,
     physical_to_vector,
@@ -60,6 +67,45 @@ def test_phase1b_loader_rejects_duplicate_accepted_cadence(tmp_path):
         load_frozen_phase1b(config)
 
 
+def test_phase1b_loader_rejects_mixed_summary_timing(tmp_path):
+    phase1b_dir = _write_phase1b_snapshot(tmp_path)
+    summary_path = phase1b_dir / "phase1b_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["fitted_results"]["global_timing_refinement"]["period_days"] = 2.25
+    _write_json(summary_path, summary)
+
+    config = Phase1CConfig(phase1b_output_dir=phase1b_dir, output_dir=tmp_path / "phase1c")
+
+    with pytest.raises(ValueError, match="Global timing refinement period_days"):
+        load_frozen_phase1b(config)
+
+
+def test_phase1b_loader_rejects_mixed_configuration_provenance(tmp_path):
+    phase1b_dir = _write_phase1b_snapshot(tmp_path)
+    provenance_path = phase1b_dir / "provenance_manifest.json"
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance["phase1b"]["configuration"]["supersample_factor"] = 7
+    _write_json(provenance_path, provenance)
+
+    config = Phase1CConfig(phase1b_output_dir=phase1b_dir, output_dir=tmp_path / "phase1c")
+
+    with pytest.raises(ValueError, match="embedded configuration"):
+        load_frozen_phase1b(config)
+
+
+def test_phase1b_loader_rejects_event_center_mismatch(tmp_path):
+    phase1b_dir = _write_phase1b_snapshot(tmp_path)
+    accepted_path = phase1b_dir / "accepted_fit_cadences.csv"
+    accepted = pd.read_csv(accepted_path)
+    accepted.loc[0, "predicted_center"] += 0.01
+    accepted.to_csv(accepted_path, index=False)
+
+    config = Phase1CConfig(phase1b_output_dir=phase1b_dir, output_dir=tmp_path / "phase1c")
+
+    with pytest.raises(ValueError, match="nonconstant predicted_center"):
+        load_frozen_phase1b(config)
+
+
 def test_timing_transform_roundtrip_across_prior_support(tmp_path):
     data, timing, _ = synthetic_dataset(Phase1CConfig(output_dir=tmp_path / "synthetic", n_ensembles=1))
     base = vector_to_physical(np.array([-2.4, 2.0, 0.4, 0.3, 0.4, -9.2, 0.0, 0.0]), timing)
@@ -93,6 +139,15 @@ def test_log_prior_is_normalized_and_rejects_invalid_physics(tmp_path):
     assert log_prior(invalid, data, Phase1CConfig(), timing) == -math.inf
     assert np.isfinite(truncated_normal_logpdf(0.5, 0.5, 0.1, (0.0, 1.0)))
     assert half_normal_logpdf(0.0, 1.0) == pytest.approx(0.5 * math.log(2.0 / math.pi))
+
+
+def test_bounded_half_normal_prior_normalizes_over_finite_jitter_bounds():
+    lower = 1.0e-8
+    upper = 0.02
+    scale = 0.0005
+    grid = np.linspace(lower, upper, 100_000)
+    density = np.exp([bounded_half_normal_logpdf(value, scale, lower, upper) for value in grid])
+    assert np.trapezoid(density, grid) == pytest.approx(1.0, rel=2.0e-5)
 
 
 def test_marginalized_event_likelihood_matches_dense_covariance():
@@ -221,17 +276,17 @@ def test_timing_support_audit_records_corners(tmp_path):
     assert "0.95 guard factor" in audit["period_support_rule"]
 
 
-def test_checkpoint_metadata_validation_and_resume_equivalence(tmp_path):
+def test_checkpoint_metadata_validation_and_resume_extension_equivalence(tmp_path):
     base_config = Phase1CConfig(
         output_dir=tmp_path / "one",
         n_ensembles=1,
         n_walkers=16,
         chunk_steps=2,
         warmup_steps=1,
-        synthetic_steps=4,
+        synthetic_steps=8,
     )
     data, timing, _ = synthetic_dataset(base_config)
-    uninterrupted = run_ensembles(data, base_config, timing, steps=4, mode="synthetic", resume=False)
+    uninterrupted = run_ensembles(data, base_config, timing, steps=8, mode="synthetic", resume=False)
     metadata = checkpoint_metadata(data, base_config, mode="synthetic")
     validate_checkpoint_metadata(uninterrupted[0].backend_path, metadata, base_config.random_seed)
 
@@ -241,17 +296,40 @@ def test_checkpoint_metadata_validation_and_resume_equivalence(tmp_path):
         n_walkers=16,
         chunk_steps=2,
         warmup_steps=1,
-        synthetic_steps=4,
+        synthetic_steps=8,
     )
     data2, timing2, _ = synthetic_dataset(resume_config)
-    run_ensembles(data2, resume_config, timing2, steps=2, mode="synthetic", resume=False)
-    resumed = run_ensembles(data2, resume_config, timing2, steps=4, mode="synthetic", resume=True)
+    run_ensembles(data2, resume_config, timing2, steps=4, mode="synthetic", resume=False)
+    mutable_resume_config = Phase1CConfig(
+        output_dir=tmp_path / "two",
+        n_ensembles=1,
+        n_walkers=16,
+        chunk_steps=3,
+        warmup_steps=2,
+        synthetic_steps=8,
+    )
+    resumed = run_ensembles(data2, mutable_resume_config, timing2, steps=8, mode="synthetic", resume=True)
 
     import emcee
 
     chain_a = emcee.backends.HDFBackend(str(uninterrupted[0].backend_path), read_only=True).get_chain()
     chain_b = emcee.backends.HDFBackend(str(resumed[0].backend_path), read_only=True).get_chain()
+    log_prob_a = emcee.backends.HDFBackend(str(uninterrupted[0].backend_path), read_only=True).get_log_prob()
+    log_prob_b = emcee.backends.HDFBackend(str(resumed[0].backend_path), read_only=True).get_log_prob()
     assert np.allclose(chain_a, chain_b)
+    assert np.allclose(log_prob_a, log_prob_b)
+
+    immutable_change = Phase1CConfig(
+        output_dir=tmp_path / "two",
+        n_ensembles=1,
+        n_walkers=18,
+        chunk_steps=2,
+        warmup_steps=1,
+        synthetic_steps=8,
+    )
+    data3, timing3, _ = synthetic_dataset(immutable_change)
+    with pytest.raises(ValueError, match="Checkpoint metadata mismatch"):
+        run_ensembles(data3, immutable_change, timing3, steps=8, mode="synthetic", resume=True)
 
 
 def test_posterior_summary_and_nonconvergence_status():
@@ -276,6 +354,84 @@ def test_posterior_summary_and_nonconvergence_status():
     )
     assert set(PARAMETER_ORDER) <= set(summary["parameter"])
     assert diagnostics["status"] == "nonconverged"
+
+
+def test_convergence_requires_complete_parameter_diagnostics(monkeypatch):
+    rng = np.random.default_rng(2)
+    chain = rng.normal(size=(16, 20, len(PARAMETER_ORDER)))
+    log_prob = rng.normal(size=(16, 20))
+
+    def fake_arviz(_chain):
+        good = {name: 1.0 for name in PARAMETER_ORDER}
+        bulk = {name: 10_000.0 for name in PARAMETER_ORDER}
+        tail = {name: 10_000.0 for name in PARAMETER_ORDER}
+        good[PARAMETER_ORDER[0]] = math.nan
+        return {"split_rhat": good, "bulk_ess": bulk, "tail_ess": tail}
+
+    monkeypatch.setattr(diagnostics_module, "_arviz_diagnostics", fake_arviz)
+    diagnostics = convergence_diagnostics(
+        chain,
+        log_prob,
+        np.full(16, 0.3),
+        np.full(len(PARAMETER_ORDER), 0.1),
+        Phase1CConfig(convergence_ess_minimum=100.0),
+        warmup_steps=1,
+        posterior_stability={"passed": True},
+        ensemble_agreement={"passed": True},
+    )
+
+    assert diagnostics["status"] == "nonconverged"
+    assert diagnostics["criteria"]["complete_valid_rhat"] is False
+
+
+def test_convergence_requires_stable_intervals_and_ensemble_agreement(monkeypatch, tmp_path):
+    config = Phase1CConfig(
+        output_dir=tmp_path / "synthetic",
+        n_ensembles=2,
+        convergence_ess_minimum=100.0,
+        convergence_stability_chunks=3,
+        convergence_ensemble_shift_threshold=0.05,
+    )
+    _, timing, _ = synthetic_dataset(config)
+    base = np.array([-2.525, 2.14, 0.32, 0.3, 0.4, -9.43, 0.0, 0.0])
+    rng = np.random.default_rng(3)
+    ensemble_a = base + rng.normal(0.0, 0.001, size=(8, 20, len(PARAMETER_ORDER)))
+    ensemble_b = base + rng.normal(0.0, 0.001, size=(8, 20, len(PARAMETER_ORDER)))
+    ensemble_b[:, :, 0] += 1.0
+    agreement = independent_ensemble_agreement([ensemble_a, ensemble_b], timing, config, warmup_steps=1)
+    assert agreement["passed"] is False
+
+    first = posterior_summary_frame(ensemble_a, timing, warmup_steps=1)
+    second = first.copy()
+    third = first.copy()
+    second["q16"] = second["median"] - 0.1
+    second["q84"] = second["median"] + 0.1
+    third["q16"] = third["median"] - 0.001
+    third["q84"] = third["median"] + 0.001
+    stability = posterior_stability_check([first, second, third], config)
+    assert stability["passed"] is False
+
+    def fake_arviz(_chain):
+        return {
+            "split_rhat": {name: 1.0 for name in PARAMETER_ORDER},
+            "bulk_ess": {name: 10_000.0 for name in PARAMETER_ORDER},
+            "tail_ess": {name: 10_000.0 for name in PARAMETER_ORDER},
+        }
+
+    monkeypatch.setattr(diagnostics_module, "_arviz_diagnostics", fake_arviz)
+    chain = np.concatenate([ensemble_a, ensemble_b], axis=0)
+    diagnostics = convergence_diagnostics(
+        chain,
+        np.zeros(chain.shape[:2]),
+        np.full(chain.shape[0], 0.3),
+        np.full(len(PARAMETER_ORDER), 0.1),
+        config,
+        warmup_steps=1,
+        posterior_stability={"passed": True},
+        ensemble_agreement=agreement,
+    )
+    assert diagnostics["status"] == "nonconverged"
+    assert diagnostics["criteria"]["independent_ensemble_agreement"] is False
 
 
 def test_generic_phase1c_modules_have_no_kepler5_planet_constant_imports():
@@ -316,11 +472,27 @@ def _write_phase1b_snapshot(tmp_path):
         }
     )
     accepted.to_csv(phase1b_dir / "accepted_fit_cadences.csv", index=False)
-    pd.DataFrame({"event_number": [0, 1, 2], "included": [True, True, True]}).to_csv(
+    pd.DataFrame(
+        {
+            "event_number": [0, 1, 2],
+            "predicted_midpoint": [1.0, 3.0, 5.0],
+            "included": [True, True, True],
+            "total_point_count": [4, 4, 4],
+        }
+    ).to_csv(
         phase1b_dir / "transit_window_audit.csv",
         index=False,
     )
-    pd.DataFrame({"product_id": ["product"], "quarter": [0]}).to_csv(
+    pd.DataFrame(
+        {
+            "product_index": [0],
+            "product_id": ["product"],
+            "quarter": [0],
+            "input_cadence_count": [12],
+            "finite_cadence_count": [12],
+            "exposure_duration_days": [0.02],
+        }
+    ).to_csv(
         phase1b_dir / "observation_product_metadata.csv",
         index=False,
     )
@@ -328,6 +500,7 @@ def _write_phase1b_snapshot(tmp_path):
         [
             {
                 "stage": "global_timing_refinement",
+                "objective_value": -100.0,
                 "rp_over_rstar": 0.08,
                 "a_over_rstar": 8.0,
                 "impact_parameter": 0.3,
@@ -344,24 +517,50 @@ def _write_phase1b_snapshot(tmp_path):
         phase1b_dir / "phase1b_configuration.json",
         {"supersample_factor": 11, "timing_refinement_t0_half_width_duration_scale": 0.5},
     )
+    phase1b_configuration = json.loads((phase1b_dir / "phase1b_configuration.json").read_text(encoding="utf-8"))
+    phase1a_record = {"fixture": True}
+    timing_refinement = {
+        "objective_value": -100.0,
+        "rp_over_rstar": 0.08,
+        "a_over_rstar": 8.0,
+        "impact_parameter": 0.3,
+        "q1": 0.3,
+        "q2": 0.4,
+        "white_noise_jitter": 0.0001,
+        "period_days": 2.0,
+        "transit_time": 1.0,
+    }
     _write_json(
         phase1b_dir / "phase1b_summary.json",
         {
             "established_inputs": {
                 "full_mission_local_refinement": {
                     "refined_period_days": 2.0,
+                    "refined_transit_time": 1.0,
                     "refined_duration_days": 0.1,
                 }
             },
             "transit_windows": {"included_count": 3, "predicted_count": 3},
+            "fitted_results": {"global_timing_refinement": timing_refinement},
+            "diagnostic_results": {
+                "residual_summary": {
+                    "by_product": [{"product_id": "product", "cadence_count": len(accepted)}],
+                }
+            },
             "acceptance_checks": {"published_physical_planet_parameters_used_or_compared": False},
         },
     )
     _write_json(
         phase1b_dir / "provenance_manifest.json",
-        {"cadence_counts": {"phase1b_fit_cadence_count": len(accepted)}},
+        {
+            "cadence_counts": {"phase1b_fit_cadence_count": len(accepted)},
+            "phase1b": {
+                "configuration": phase1b_configuration,
+                "phase1a_input_record": phase1a_record,
+            },
+        },
     )
-    _write_json(phase1b_dir / "phase1a_input_record.json", {"fixture": True})
+    _write_json(phase1b_dir / "phase1a_input_record.json", phase1a_record)
     return phase1b_dir
 
 

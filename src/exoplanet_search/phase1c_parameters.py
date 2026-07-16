@@ -323,7 +323,12 @@ def log_prior(
         config.q_bounds,
     )
     jitter_scale = jitter_prior_scale(data, config)
-    logp += half_normal_logpdf(sample.jitter, jitter_scale) + math.log(sample.jitter)
+    logp += bounded_half_normal_logpdf(
+        sample.jitter,
+        jitter_scale,
+        config.jitter_lower,
+        config.jitter_upper,
+    ) + math.log(sample.jitter)
     logp += -math.log(2.0 * timing.period_half_width)
     logp += -math.log(2.0 * timing.mid_epoch_half_width)
     return float(logp)
@@ -355,6 +360,24 @@ def half_normal_logpdf(value: float, scale: float) -> float:
     if value < 0.0:
         return -math.inf
     return float(0.5 * math.log(2.0 / math.pi) - math.log(scale) - 0.5 * (value / scale) ** 2)
+
+
+def bounded_half_normal_logpdf(value: float, scale: float, lower: float, upper: float) -> float:
+    """Half-normal density normalized over finite configured jitter bounds."""
+    if not lower <= value <= upper:
+        return -math.inf
+    if lower < 0.0 or upper <= lower:
+        raise ValueError("Bounded half-normal requires 0 <= lower < upper.")
+    normalization = _half_normal_cdf(upper, scale) - _half_normal_cdf(lower, scale)
+    if normalization <= 0.0:
+        raise ValueError("Bounded half-normal normalization is nonpositive.")
+    return half_normal_logpdf(value, scale) - math.log(normalization)
+
+
+def _half_normal_cdf(value: float, scale: float) -> float:
+    if value < 0.0:
+        return 0.0
+    return float(2.0 * ndtr(value / scale) - 1.0)
 
 
 def jitter_prior_scale(data: FrozenPhase1BData, config: Phase1CConfig) -> float:
@@ -412,11 +435,15 @@ def prior_description(data: FrozenPhase1BData, config: Phase1CConfig, timing: Ti
             "sigma_floor": config.limb_darkening_sigma_floor,
         },
         "jitter_prior": {
-            "family": "half-normal in physical jitter",
+            "family": "half-normal in physical jitter, normalized over finite configured bounds",
             "scale": jitter_prior_scale(data, config),
             "scale_source": "configured multiple of median positive cadence flux uncertainty",
             "median_uncertainty_multiple": config.jitter_prior_median_uncertainty_multiple,
         },
+        "a_over_rstar_prior_interpretation": (
+            "independent log-uniform prior over configured bounds followed by physical geometry rejection; "
+            "not conditionally renormalized above 1 + Rp/Rstar"
+        ),
         "baseline_priors": {
             "intercept": {"mean": 1.0, "sigma": config.baseline_intercept_sigma},
             "slope": {"mean": 0.0, "sigma": config.baseline_slope_sigma},

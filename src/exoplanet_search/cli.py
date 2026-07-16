@@ -242,8 +242,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--phase1c-synthetic-steps", type=int, default=80)
     parser.add_argument("--phase1c-synthetic-recovery-steps", type=int, default=2000)
     parser.add_argument("--phase1c-production-steps", type=int, default=2000)
+    parser.add_argument("--phase1c-target-total-steps", type=int, default=None)
+    parser.add_argument("--phase1c-additional-steps", type=int, default=None)
     parser.add_argument("--phase1c-chunk-steps", type=int, default=12)
     parser.add_argument("--phase1c-warmup-steps", type=int, default=8)
+    parser.add_argument(
+        "--phase1c-summarize-mode",
+        choices=("pilot", "production", "synthetic", "synthetic_recovery"),
+        default="pilot",
+    )
     return parser
 
 
@@ -564,6 +571,8 @@ def _phase1c_config_from_args(args) -> Phase1CConfig:
         synthetic_steps=args.phase1c_synthetic_steps,
         synthetic_recovery_steps=args.phase1c_synthetic_recovery_steps,
         production_steps=args.phase1c_production_steps,
+        target_total_steps=args.phase1c_target_total_steps,
+        additional_steps=args.phase1c_additional_steps,
         chunk_steps=args.phase1c_chunk_steps,
         warmup_steps=args.phase1c_warmup_steps,
     )
@@ -597,7 +606,7 @@ def _run_phase1c_from_args(args) -> None:
         elif args.phase1c_production:
             result = run_phase1c_production(config, resume=args.phase1c_resume)
         else:
-            result = summarize_phase1c_checkpoints(config)
+            result = summarize_phase1c_checkpoints(config, mode=args.phase1c_summarize_mode)
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         raise SystemExit(f"Phase 1C {requested[0]} failed: {exc}") from exc
     print(f"Wrote Phase 1C {requested[0]} outputs under: {config.output_dir}")

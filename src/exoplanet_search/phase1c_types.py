@@ -35,6 +35,8 @@ class Phase1CConfig:
     synthetic_steps: int = 80
     synthetic_recovery_steps: int = 2000
     production_steps: int = 2000
+    target_total_steps: int | None = None
+    additional_steps: int | None = None
     chunk_steps: int = 12
     warmup_steps: int = 8
     supersample_factor: int = 11
@@ -51,6 +53,10 @@ class Phase1CConfig:
     convergence_rhat_threshold: float = 1.01
     convergence_ess_minimum: float = 1000.0
     convergence_tau_multiple: float = 50.0
+    convergence_stability_chunks: int = 3
+    convergence_stability_sigma_threshold: float = 0.25
+    convergence_ensemble_shift_threshold: float = 3.0
+    convergence_interval_overlap_minimum: float = 0.25
     max_pilot_seconds: float = 600.0
     minimum_meaningful_summary_draws: int = 1000
     local_tight_scales: tuple[float, ...] = (0.015, 0.02, 0.015, 0.015, 0.015, 0.05, 1.0e-5, 2.0e-4)

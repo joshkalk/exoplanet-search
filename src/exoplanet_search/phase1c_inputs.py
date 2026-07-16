@@ -36,6 +36,10 @@ def load_frozen_phase1b(config: Phase1CConfig) -> FrozenPhase1BData:
     phase1b_configuration = _read_json(input_dir / "phase1b_configuration.json")
     phase1b_summary = _read_json(input_dir / "phase1b_summary.json")
     provenance = _read_json(input_dir / "provenance_manifest.json")
+    phase1a_input_record = None
+    phase1a_path = input_dir / "phase1a_input_record.json"
+    if phase1a_path.exists():
+        phase1a_input_record = _read_json(phase1a_path)
 
     _validate_accepted_cadences(accepted)
     _validate_phase1b_consistency(
@@ -46,6 +50,7 @@ def load_frozen_phase1b(config: Phase1CConfig) -> FrozenPhase1BData:
         phase1b_configuration=phase1b_configuration,
         phase1b_summary=phase1b_summary,
         provenance=provenance,
+        phase1a_input_record=phase1a_input_record,
     )
     timing_refined = _timing_refined_parameters(parameters)
     return FrozenPhase1BData(
@@ -137,6 +142,10 @@ def _validate_accepted_cadences(accepted: pd.DataFrame) -> None:
         raise ValueError("accepted_fit_cadences.csv has nonpositive exposure durations.")
     if accepted.duplicated(subset=["time", "event_number", "product_id"]).any():
         raise ValueError("accepted_fit_cadences.csv contains duplicate accepted observations.")
+    _require_integral_values(accepted, "event_number", "accepted_fit_cadences.csv")
+    for column in ("product_id", "quarter"):
+        if accepted[column].astype(str).str.strip().eq("").any():
+            raise ValueError(f"accepted_fit_cadences.csv has blank {column} values.")
 
 
 def _validate_phase1b_consistency(
@@ -148,7 +157,13 @@ def _validate_phase1b_consistency(
     phase1b_configuration: dict[str, Any],
     phase1b_summary: dict[str, Any],
     provenance: dict[str, Any],
+    phase1a_input_record: dict[str, Any] | None,
 ) -> None:
+    _require_columns(audit, {"event_number", "predicted_midpoint", "included"}, "transit_window_audit.csv")
+    _require_columns(products, {"product_id", "quarter", "exposure_duration_days"}, "observation_product_metadata.csv")
+    _require_columns(parameters, {"stage"}, "deterministic_fit_parameters.csv")
+    _validate_embedded_phase1b_configuration(phase1b_configuration, provenance)
+    _validate_embedded_phase1a_record(phase1a_input_record, provenance)
     included = audit[audit["included"].astype(str).str.lower().isin({"true", "1"})]
     if len(included) != int(phase1b_summary["transit_windows"]["included_count"]):
         raise ValueError("Phase 1B included transit-window count mismatch.")
@@ -160,10 +175,14 @@ def _validate_phase1b_consistency(
         raise ValueError("Accepted cadence event identifiers do not match included audit rows.")
     if int(provenance.get("cadence_counts", {}).get("phase1b_fit_cadence_count", -1)) != len(accepted):
         raise ValueError("Phase 1B provenance cadence count does not match accepted cadences.")
+    _validate_integer_columns(accepted, audit, products)
+    _validate_event_centers(accepted, included, phase1b_summary)
+    _validate_product_metadata(accepted, products, phase1b_summary)
     if set(accepted["product_id"].astype(str)) - set(products["product_id"].astype(str)):
         raise ValueError("Accepted cadence product identifiers are absent from product metadata.")
     if "global_timing_refinement" not in set(parameters["stage"].astype(str)):
         raise ValueError("deterministic_fit_parameters.csv lacks global_timing_refinement row.")
+    _validate_timing_refinement_parameters(parameters, phase1b_summary)
     if int(phase1b_configuration.get("supersample_factor", -1)) <= 0:
         raise ValueError("Phase 1B configuration has invalid supersample factor.")
     if phase1b_summary["acceptance_checks"].get("published_physical_planet_parameters_used_or_compared") is not False:
@@ -183,6 +202,164 @@ def _timing_refined_parameters(parameters: pd.DataFrame) -> dict[str, float]:
         "transit_time",
     )
     return {key: float(row[key]) for key in keys}
+
+
+def _require_columns(frame: pd.DataFrame, columns: set[str], label: str) -> None:
+    missing = sorted(columns - set(frame.columns))
+    if missing:
+        raise ValueError(f"{label} missing columns: {missing}")
+
+
+def _validate_embedded_phase1b_configuration(
+    phase1b_configuration: dict[str, Any],
+    provenance: dict[str, Any],
+) -> None:
+    embedded = provenance.get("phase1b", {}).get("configuration")
+    if not isinstance(embedded, dict):
+        raise ValueError("provenance_manifest.json lacks embedded Phase 1B configuration.")
+    if _canonical_payload(embedded) != _canonical_payload(phase1b_configuration):
+        raise ValueError("phase1b_configuration.json does not match provenance embedded configuration.")
+
+
+def _validate_embedded_phase1a_record(
+    phase1a_input_record: dict[str, Any] | None,
+    provenance: dict[str, Any],
+) -> None:
+    embedded = provenance.get("phase1b", {}).get("phase1a_input_record")
+    if phase1a_input_record is None:
+        if embedded is not None:
+            raise ValueError("provenance_manifest.json embeds a Phase 1A record but phase1a_input_record.json is absent.")
+        return
+    if not isinstance(embedded, dict):
+        raise ValueError("phase1a_input_record.json exists but provenance lacks embedded Phase 1A record.")
+    if _canonical_payload(embedded) != _canonical_payload(phase1a_input_record):
+        raise ValueError("phase1a_input_record.json does not match provenance embedded Phase 1A record.")
+
+
+def _validate_integer_columns(
+    accepted: pd.DataFrame,
+    audit: pd.DataFrame,
+    products: pd.DataFrame,
+) -> None:
+    _require_integral_values(audit, "event_number", "transit_window_audit.csv")
+    for column in (
+        "total_point_count",
+        "expected_in_transit_point_count",
+        "left_in_transit_point_count",
+        "right_in_transit_point_count",
+        "pre_transit_baseline_count",
+        "post_transit_baseline_count",
+    ):
+        if column in audit:
+            _require_integral_values(audit, column, "transit_window_audit.csv")
+    for column in ("product_index", "input_cadence_count", "finite_cadence_count"):
+        if column in products:
+            _require_integral_values(products, column, "observation_product_metadata.csv")
+    if "quarter" in products:
+        _require_integral_values(products, "quarter", "observation_product_metadata.csv")
+    if accepted["quarter"].astype(str).str.fullmatch(r"[+-]?\d+").all():
+        _require_integral_values(accepted, "quarter", "accepted_fit_cadences.csv")
+
+
+def _validate_event_centers(
+    accepted: pd.DataFrame,
+    included: pd.DataFrame,
+    phase1b_summary: dict[str, Any],
+) -> None:
+    ephemeris = phase1b_summary["established_inputs"]["full_mission_local_refinement"]
+    frozen_period = float(ephemeris["refined_period_days"])
+    frozen_t0 = float(ephemeris["refined_transit_time"])
+    audit_midpoints = {
+        int(row["event_number"]): float(row["predicted_midpoint"])
+        for _, row in included.iterrows()
+    }
+    for event, group in accepted.groupby(accepted["event_number"].astype(int)):
+        centers = pd.to_numeric(group["predicted_center"], errors="coerce").to_numpy(dtype=float)
+        if float(np.max(centers) - np.min(centers)) > 1.0e-9:
+            raise ValueError(f"Accepted cadences have nonconstant predicted_center for event {event}.")
+        expected = frozen_t0 + event * frozen_period
+        center = float(np.median(centers))
+        if event not in audit_midpoints:
+            raise ValueError(f"Accepted event {event} is absent from included transit audit rows.")
+        if not np.isclose(center, audit_midpoints[event], rtol=0.0, atol=1.0e-9):
+            raise ValueError(f"Accepted predicted_center disagrees with audit midpoint for event {event}.")
+        if not np.isclose(center, expected, rtol=0.0, atol=1.0e-8):
+            raise ValueError(f"Accepted predicted_center disagrees with frozen ephemeris for event {event}.")
+
+
+def _validate_product_metadata(
+    accepted: pd.DataFrame,
+    products: pd.DataFrame,
+    phase1b_summary: dict[str, Any],
+) -> None:
+    product_table = products.set_index(products["product_id"].astype(str), drop=False)
+    product_counts = accepted.groupby(accepted["product_id"].astype(str)).size().to_dict()
+    diagnostic_results = phase1b_summary.get("diagnostic_results", {})
+    residual_counts = {
+        str(row["product_id"]): int(row["cadence_count"])
+        for row in diagnostic_results.get("residual_summary", {}).get("by_product", [])
+        if "product_id" in row and "cadence_count" in row
+    }
+    for product_id, group in accepted.groupby(accepted["product_id"].astype(str)):
+        if product_id not in product_table.index:
+            raise ValueError(f"Accepted product {product_id} is absent from product metadata.")
+        product_row = product_table.loc[product_id]
+        if isinstance(product_row, pd.DataFrame):
+            raise ValueError(f"Product metadata has duplicate product_id {product_id}.")
+        quarters = {str(value) for value in group["quarter"]}
+        if quarters != {str(product_row["quarter"])}:
+            raise ValueError(f"Accepted quarter disagrees with product metadata for {product_id}.")
+        accepted_exposure = pd.to_numeric(group["exposure_days"], errors="coerce").to_numpy(dtype=float)
+        metadata_exposure = float(product_row["exposure_duration_days"])
+        if not np.isfinite(metadata_exposure) or metadata_exposure <= 0.0:
+            raise ValueError(f"Product metadata has invalid exposure duration for {product_id}.")
+        if not np.allclose(accepted_exposure, metadata_exposure, rtol=0.0, atol=1.0e-12):
+            raise ValueError(f"Accepted exposure duration disagrees with product metadata for {product_id}.")
+    if residual_counts and residual_counts != {key: int(value) for key, value in product_counts.items()}:
+        raise ValueError("Phase 1B residual by-product cadence counts do not match accepted cadences.")
+
+
+def _validate_timing_refinement_parameters(
+    parameters: pd.DataFrame,
+    phase1b_summary: dict[str, Any],
+) -> None:
+    row = parameters[parameters["stage"].astype(str) == "global_timing_refinement"].iloc[0]
+    summary = phase1b_summary.get("fitted_results", {}).get("global_timing_refinement")
+    if not isinstance(summary, dict):
+        raise ValueError("phase1b_summary.json lacks fitted_results.global_timing_refinement.")
+    required = (
+        "objective_value",
+        "rp_over_rstar",
+        "a_over_rstar",
+        "impact_parameter",
+        "q1",
+        "q2",
+        "white_noise_jitter",
+        "period_days",
+        "transit_time",
+    )
+    for key in required:
+        if key not in row or key not in summary:
+            raise ValueError(f"Global timing refinement is missing {key}.")
+        tolerance = 1.0e-9 if key == "objective_value" else 1.0e-12
+        if not np.isclose(float(row[key]), float(summary[key]), rtol=0.0, atol=tolerance):
+            raise ValueError(f"Global timing refinement {key} disagrees between CSV and summary JSON.")
+
+
+def _require_integral_values(frame: pd.DataFrame, column: str, label: str) -> None:
+    values = pd.to_numeric(frame[column], errors="coerce").to_numpy(dtype=float)
+    if not np.all(np.isfinite(values)) or not np.all(np.equal(values, np.rint(values))):
+        raise ValueError(f"{label} has nonintegral {column} values.")
+
+
+def _canonical_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _canonical_payload(item) for key, item in sorted(value.items())}
+    if isinstance(value, list):
+        return [_canonical_payload(item) for item in value]
+    if isinstance(value, str):
+        return value.replace("\\", "/")
+    return value
 
 
 def _read_json(path: Path) -> dict[str, Any]:

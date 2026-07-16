@@ -364,17 +364,68 @@ def aggregate_profiler_summary(profilers: list[PosteriorProfiler]) -> dict[str, 
 
 def checkpoint_metadata(data: FrozenPhase1BData, config: Phase1CConfig, *, mode: str) -> dict[str, Any]:
     """Return metadata that binds checkpoints to inputs, config, and dependency versions."""
-    config_payload = config.to_dict()
-    config_sha = hashlib.sha256(
-        json.dumps(config_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    identity = immutable_checkpoint_identity(data, config, mode=mode)
+    identity_sha = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     return {
         "mode": mode,
         "run_id": config.run_id,
+        "immutable_scientific_identity_sha256": identity_sha,
+        "immutable_scientific_identity": identity,
+    }
+
+
+def immutable_checkpoint_identity(
+    data: FrozenPhase1BData,
+    config: Phase1CConfig,
+    *,
+    mode: str,
+) -> dict[str, Any]:
+    """Return checkpoint identity excluding mutable execution controls."""
+    payload = config.to_dict()
+    for key in (
+        "output_dir",
+        "run_id",
+        "pilot_steps",
+        "synthetic_steps",
+        "synthetic_recovery_steps",
+        "production_steps",
+        "target_total_steps",
+        "additional_steps",
+        "chunk_steps",
+        "warmup_steps",
+        "max_pilot_seconds",
+        "minimum_meaningful_summary_draws",
+    ):
+        payload.pop(key, None)
+    return {
+        "mode": mode,
         "phase1b_input_manifest_sha256": data.input_manifest["manifest_sha256"],
-        "phase1c_configuration_sha256": config_sha,
-        "parameter_order": list(PARAMETER_ORDER),
-        "transform_record": "log_rp, log_a, z_b, q1, q2, log_jitter, period_offset, mid_epoch_offset",
+        "model": {
+            "transit": "batman circular one-planet quadratic limb-darkening",
+            "likelihood": "Gaussian cadence noise with exact Gaussian local-baseline marginalization",
+            "baseline_treatment": {
+                "intercept_mean": 1.0,
+                "intercept_sigma": config.baseline_intercept_sigma,
+                "slope_mean": 0.0,
+                "slope_sigma": config.baseline_slope_sigma,
+            },
+            "supersample_factor": config.supersample_factor,
+        },
+        "priors_and_transforms": {
+            "parameter_order": list(PARAMETER_ORDER),
+            "transform_record": "log_rp, log_a, z_b, q1, q2, log_jitter, period_offset, mid_epoch_offset",
+            "configuration": payload,
+            "a_over_rstar_prior_interpretation": (
+                "independent log-uniform draw over configured bounds followed by physical geometry rejection"
+            ),
+        },
+        "sampler": {
+            "n_walkers": config.n_walkers,
+            "n_ensembles": config.n_ensembles,
+            "seeds": [int(config.random_seed + 1000 * index) for index in range(config.n_ensembles)],
+        },
         "dependencies": dependency_versions(),
     }
 
