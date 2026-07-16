@@ -252,8 +252,74 @@ Phase 1B is deterministic and diagnostic. It records multi-start optimizer
 behavior, residuals, exposure-integration convergence, fixed versus fitted
 limb-darkening results, timing-refinement shifts, and stability checks, but it
 does not claim final parameter uncertainties. Posterior sampling and convergence
-analysis are deferred to Phase 1B-B.
+analysis are deferred to Phase 1C.
 
 Published physical planet values for Kepler-5 b are not used for Phase 1B
 initialization, bounds, fitting, tests, diagnostics, or comparison in this
 branch.
+
+## Phase 1C: posterior uncertainty first pass
+
+Phase 1C consumes the frozen Phase 1B cadence snapshot and estimates posterior
+uncertainty with an `emcee` ensemble sampler. It does not rebuild Phase 0,
+Phase 1A, or Phase 1B, does not redownload Kepler data, does not use
+`residuals.csv` as fitting input, and does not use published Kepler-5 b planet
+parameters.
+
+This first implementation pass includes transformed transit parameters,
+normalized priors, exact Gaussian marginalization of one local linear baseline
+per accepted event, independent HDF-backed ensembles, checkpoint metadata,
+synthetic validation, convergence diagnostics, and a deliberately short
+real-data pilot. Posterior predictive checks, Student's-t reweighting,
+supersampling-21 reweighting, broader limb-darkening sensitivity checks, and
+fixed-limb-darkening posterior runs remain pending.
+
+Validate the frozen Phase 1B inputs and write checksums. Each Phase 1C
+invocation writes to an isolated run directory under the configured output
+base; pass `--phase1c-run-id` for a deterministic directory name:
+
+```bash
+python -m exoplanet_search.cli --phase1c-validate-inputs --phase1c-run-id validate-demo
+```
+
+Run the short synthetic smoke test. A short nonconverged smoke chain can only
+show that finite evaluation, sampler movement, checkpointing, transformations,
+and outputs work; it is not a posterior recovery claim:
+
+```bash
+python -m exoplanet_search.cli --phase1c-synthetic-validation --phase1c-run-id synthetic-smoke
+```
+
+Run a short real-data pilot. This is nonproduction and is expected to report
+nonconvergence when the configured step count is too small:
+
+```bash
+python -m exoplanet_search.cli --phase1c-pilot --phase1c-run-id pilot-demo
+```
+
+Resume an interrupted pilot after checkpoint metadata validation:
+
+```bash
+python -m exoplanet_search.cli --phase1c-pilot --phase1c-resume --phase1c-run-id pilot-demo
+```
+
+Run production sampling only when ready for a long posterior run:
+
+```bash
+python -m exoplanet_search.cli --phase1c-production --phase1c-run-id production-001
+```
+
+Summarize existing checkpoints without taking more samples:
+
+```bash
+python -m exoplanet_search.cli --phase1c-summarize
+```
+
+Outputs are written below `data/interim/kepler5_phase1c_posterior/` in
+mode-prefixed run directories such as `pilot_<run-id>/`, including
+configuration, the Phase 1B input manifest, provenance, one HDF backend per
+ensemble, runtime and convergence diagnostics, posterior summaries, ensemble
+summaries, and basic trace/marginal/correlation plots when enough samples are
+available. Existing run directories are not overwritten unless resuming that
+specific run. The Phase 1B accepted cadences remain frozen and checksummed;
+Phase 1C rejects confirmed input mismatches rather than modifying that snapshot.

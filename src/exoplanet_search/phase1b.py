@@ -380,7 +380,7 @@ def build_summary(
             "fitting_data": "unbinned accepted cadences in objective transit windows",
             "local_baseline": "one multiplicative linear baseline solved analytically per accepted transit",
             "exposure_integration": "BATMAN supersample exposure integration grouped by exposure duration",
-            "posterior_uncertainty": "deferred to Phase 1B-B",
+            "posterior_uncertainty": "deferred to Phase 1C",
             "anti_leakage_statement": ANTI_LEAKAGE_STATEMENT,
         },
         "configuration": config.to_dict(),
@@ -405,7 +405,7 @@ def build_summary(
         "warnings": sorted(set(warnings)),
         "unresolved_limitations": [
             "Deterministic optimizer diagnostics are not final parameter uncertainties.",
-            "Posterior sampling and convergence analysis are deferred to Phase 1B-B.",
+            "Posterior sampling and convergence analysis are deferred to Phase 1C.",
         ],
         "acceptance_checks": {
             "physical_batman_model_fit": True,

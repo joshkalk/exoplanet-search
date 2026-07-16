@@ -16,6 +16,7 @@ from .config import (
     DEFAULT_MISSION,
     DEFAULT_PHASE1A_DIR,
     DEFAULT_PHASE1B_DIR,
+    DEFAULT_PHASE1C_DIR,
     DEFAULT_QUALITY_BITMASK,
     DEFAULT_RECOVERY_DIR,
     DEFAULT_TIME_SYSTEM,
@@ -37,6 +38,14 @@ from .inspection import (
 from .phase1a import BLSSearchConfig, run_phase1a_search
 from .phase1b import run_phase1b_fit
 from .phase1b_types import Phase1BConfig
+from .phase1c import (
+    run_phase1c_pilot,
+    run_phase1c_production,
+    run_phase1c_synthetic_validation,
+    summarize_phase1c_checkpoints,
+    validate_phase1c_inputs,
+)
+from .phase1c_types import Phase1CConfig
 from .preprocessing import PREPROCESSING_MODES, PreprocessingConfig, preprocess_light_curve
 from .provenance import build_provenance_manifest, write_json
 from .recovery import (
@@ -178,12 +187,80 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--phase1b-random-seed", type=int, default=481516)
     parser.add_argument("--phase1b-supersample-factor", type=int, default=11)
     parser.add_argument("--phase1b-high-supersample-factor", type=int, default=21)
+    parser.add_argument(
+        "--phase1c-validate-inputs",
+        action="store_true",
+        help="Validate frozen Phase 1B inputs for Phase 1C without downloading or rebuilding.",
+    )
+    parser.add_argument(
+        "--phase1c-synthetic-validation",
+        action="store_true",
+        help="Run the reproducible synthetic Phase 1C sampler validation.",
+    )
+    parser.add_argument(
+        "--phase1c-synthetic-recovery",
+        action="store_true",
+        help="Run a longer synthetic Phase 1C recovery attempt; recovery is claimed only if converged.",
+    )
+    parser.add_argument(
+        "--phase1c-pilot",
+        action="store_true",
+        help="Run a short nonproduction real-data Phase 1C pilot from frozen Phase 1B outputs.",
+    )
+    parser.add_argument(
+        "--phase1c-production",
+        action="store_true",
+        help="Run production Phase 1C posterior sampling from frozen Phase 1B outputs.",
+    )
+    parser.add_argument(
+        "--phase1c-summarize",
+        action="store_true",
+        help="Summarize existing Phase 1C checkpoints without sampling.",
+    )
+    parser.add_argument(
+        "--phase1c-resume",
+        action="store_true",
+        help="Resume Phase 1C HDF checkpoints after validating checkpoint metadata.",
+    )
+    parser.add_argument(
+        "--phase1c-phase1b-dir",
+        type=Path,
+        default=DEFAULT_PHASE1B_DIR,
+        help="Frozen Phase 1B output directory consumed by Phase 1C.",
+    )
+    parser.add_argument(
+        "--phase1c-output-dir",
+        type=Path,
+        default=DEFAULT_PHASE1C_DIR,
+        help="Directory for Phase 1C posterior outputs.",
+    )
+    parser.add_argument("--phase1c-random-seed", type=int, default=20260715)
+    parser.add_argument("--phase1c-run-id", default=None, help="Deterministic Phase 1C run ID for isolated outputs.")
+    parser.add_argument("--phase1c-n-ensembles", type=int, default=4)
+    parser.add_argument("--phase1c-n-walkers", type=int, default=24)
+    parser.add_argument("--phase1c-pilot-steps", type=int, default=24)
+    parser.add_argument("--phase1c-synthetic-steps", type=int, default=80)
+    parser.add_argument("--phase1c-synthetic-recovery-steps", type=int, default=2000)
+    parser.add_argument("--phase1c-production-steps", type=int, default=2000)
+    parser.add_argument("--phase1c-target-total-steps", type=int, default=None)
+    parser.add_argument("--phase1c-additional-steps", type=int, default=None)
+    parser.add_argument("--phase1c-chunk-steps", type=int, default=12)
+    parser.add_argument("--phase1c-warmup-steps", type=int, default=8)
+    parser.add_argument(
+        "--phase1c-summarize-mode",
+        choices=("pilot", "production", "synthetic", "synthetic_recovery"),
+        default="pilot",
+    )
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
     _validate_target_specific_options(args)
+
+    if _phase1c_requested(args):
+        _run_phase1c_from_args(args)
+        return
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     args.download_dir.mkdir(parents=True, exist_ok=True)
@@ -467,6 +544,73 @@ def _validate_target_specific_options(args) -> None:
             "Kepler-5. Run ordinary inspection without those flags, or add a "
             "target-specific ephemeris before using these diagnostics."
         )
+
+
+def _phase1c_requested(args) -> bool:
+    return any(
+        (
+            args.phase1c_validate_inputs,
+            args.phase1c_synthetic_validation,
+            args.phase1c_synthetic_recovery,
+            args.phase1c_pilot,
+            args.phase1c_production,
+            args.phase1c_summarize,
+        )
+    )
+
+
+def _phase1c_config_from_args(args) -> Phase1CConfig:
+    return Phase1CConfig(
+        phase1b_output_dir=args.phase1c_phase1b_dir,
+        output_dir=args.phase1c_output_dir,
+        run_id=args.phase1c_run_id,
+        random_seed=args.phase1c_random_seed,
+        n_ensembles=args.phase1c_n_ensembles,
+        n_walkers=args.phase1c_n_walkers,
+        pilot_steps=args.phase1c_pilot_steps,
+        synthetic_steps=args.phase1c_synthetic_steps,
+        synthetic_recovery_steps=args.phase1c_synthetic_recovery_steps,
+        production_steps=args.phase1c_production_steps,
+        target_total_steps=args.phase1c_target_total_steps,
+        additional_steps=args.phase1c_additional_steps,
+        chunk_steps=args.phase1c_chunk_steps,
+        warmup_steps=args.phase1c_warmup_steps,
+    )
+
+
+def _run_phase1c_from_args(args) -> None:
+    config = _phase1c_config_from_args(args)
+    requested = [
+        name
+        for name, enabled in (
+            ("validate-inputs", args.phase1c_validate_inputs),
+            ("synthetic-validation", args.phase1c_synthetic_validation),
+            ("synthetic-recovery", args.phase1c_synthetic_recovery),
+            ("pilot", args.phase1c_pilot),
+            ("production", args.phase1c_production),
+            ("summarize", args.phase1c_summarize),
+        )
+        if enabled
+    ]
+    if len(requested) != 1:
+        raise SystemExit(f"Choose exactly one Phase 1C mode, got: {', '.join(requested)}")
+    try:
+        if args.phase1c_validate_inputs:
+            result = validate_phase1c_inputs(config)
+        elif args.phase1c_synthetic_validation:
+            result = run_phase1c_synthetic_validation(config, resume=args.phase1c_resume)
+        elif args.phase1c_synthetic_recovery:
+            result = run_phase1c_synthetic_validation(config, resume=args.phase1c_resume, recovery=True)
+        elif args.phase1c_pilot:
+            result = run_phase1c_pilot(config, resume=args.phase1c_resume)
+        elif args.phase1c_production:
+            result = run_phase1c_production(config, resume=args.phase1c_resume)
+        else:
+            result = summarize_phase1c_checkpoints(config, mode=args.phase1c_summarize_mode)
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        raise SystemExit(f"Phase 1C {requested[0]} failed: {exc}") from exc
+    print(f"Wrote Phase 1C {requested[0]} outputs under: {config.output_dir}")
+    print(json.dumps(result, indent=2))
 
 
 def _is_kepler5_target(target: str) -> bool:

@@ -18,6 +18,7 @@ DEFAULT_WINDOWED_RECOVERY_DIR = DATA_INTERIM_DIR / "kepler5_windowed_recovery"
 DEFAULT_COMPARISON_DIR = DATA_INTERIM_DIR / "kepler5_preprocessing_comparison"
 DEFAULT_PHASE1A_DIR = DATA_INTERIM_DIR / "kepler5_phase1a_search"
 DEFAULT_PHASE1B_DIR = DATA_INTERIM_DIR / "kepler5_phase1b_fit"
+DEFAULT_PHASE1C_DIR = DATA_INTERIM_DIR / "kepler5_phase1c_posterior"
 
 # Kepler-5 b ephemeris from the NASA Exoplanet Archive DR25 KOI solution.
 # Kepler light-curve times are handled in BKJD for this recovery step.
