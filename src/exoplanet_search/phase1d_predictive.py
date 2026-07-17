@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -11,8 +11,7 @@ import numpy as np
 
 from .phase1c_likelihood import event_local_coordinate, marginalized_event_log_likelihood, transit_model_for_vector
 from .phase1c_parameters import vector_to_physical
-from .phase1c_types import FrozenPhase1BData, Phase1CConfig, TimingReference
-from .phase1d_draws import SelectedPosteriorDraw
+from .phase1d_draws import SelectedPosteriorDraw, ValidatedPhase1DSource
 
 
 @dataclass(frozen=True)
@@ -48,16 +47,19 @@ class EventBaselineDraw:
         }
 
 
+@dataclass(frozen=True)
+class _PredictiveContext:
+    source: ValidatedPhase1DSource
+    draw: SelectedPosteriorDraw
+    physical: Any
+    full_transit_model: np.ndarray
+
+
 def draw_conditional_event_baseline(
+    source: ValidatedPhase1DSource,
     draw: SelectedPosteriorDraw,
     event_number: int,
-    data: FrozenPhase1BData,
-    config: Phase1CConfig,
-    timing: TimingReference,
     rng: np.random.Generator,
-    *,
-    transit_model: np.ndarray | None = None,
-    physical=None,
 ) -> EventBaselineDraw:
     """Draw beta | y, theta for one event using the exact Phase 1C Gaussian conditional.
 
@@ -66,13 +68,21 @@ def draw_conditional_event_baseline(
     then samples beta from the conditional Normal distribution returned by the
     marginalized calculation. It does not refit or approximate the Gaussian path.
     """
-    sample = physical if physical is not None else vector_to_physical(draw.vector, timing)
-    if transit_model is None:
-        transit_model = transit_model_for_vector(draw.vector, data, config, timing)
+    context = _predictive_context(source, draw)
+    return _draw_conditional_event_baseline(context, int(event_number), rng)
+
+
+def _draw_conditional_event_baseline(
+    context: _PredictiveContext,
+    event_number: int,
+    rng: np.random.Generator,
+) -> EventBaselineDraw:
+    data = context.source.data
+    config = context.source.config
     mask = data.event_number == int(event_number)
     if not np.any(mask):
         raise ValueError(f"Unknown event_number {event_number}.")
-    event_model = transit_model[mask]
+    event_model = context.full_transit_model[mask]
     x = event_local_coordinate(data.time[mask], float(np.median(data.predicted_center[mask])))
     result = marginalized_event_log_likelihood(
         time=data.time[mask],
@@ -80,7 +90,7 @@ def draw_conditional_event_baseline(
         flux_uncertainty=data.flux_uncertainty[mask],
         transit_model=event_model,
         frozen_center=float(np.median(data.predicted_center[mask])),
-        jitter=sample.jitter,
+        jitter=context.physical.jitter,
         baseline_intercept_sigma=config.baseline_intercept_sigma,
         baseline_slope_sigma=config.baseline_slope_sigma,
     )
@@ -101,10 +111,8 @@ def draw_conditional_event_baseline(
 
 
 def generate_replicated_flux(
+    source: ValidatedPhase1DSource,
     draw: SelectedPosteriorDraw,
-    data: FrozenPhase1BData,
-    config: Phase1CConfig,
-    timing: TimingReference,
     rng: np.random.Generator,
     *,
     replication_index: int = 0,
@@ -116,8 +124,9 @@ def generate_replicated_flux(
     generated independent Gaussian noise with variance sigma_i^2 + jitter^2.
     Observed residuals are never resampled.
     """
-    sample = vector_to_physical(draw.vector, timing)
-    full_transit_model = transit_model_for_vector(draw.vector, data, config, timing)
+    context = _predictive_context(source, draw)
+    sample = context.physical
+    data = source.data
     n_cadences = data.cadence_count
     model_flux = np.empty(n_cadences, dtype=float)
     predictive_mean = np.empty(n_cadences, dtype=float)
@@ -128,16 +137,7 @@ def generate_replicated_flux(
     baseline_audit = []
     for event in np.unique(data.event_number):
         mask = data.event_number == event
-        baseline = draw_conditional_event_baseline(
-            draw,
-            int(event),
-            data,
-            config,
-            timing,
-            rng,
-            transit_model=full_transit_model,
-            physical=sample,
-        )
+        baseline = _draw_conditional_event_baseline(context, int(event), rng)
         mean = baseline.design_matrix @ baseline.coefficients
         variance = np.square(data.flux_uncertainty[mask]) + sample.jitter**2
         noise = rng.normal(0.0, np.sqrt(variance))
@@ -173,6 +173,36 @@ def generate_replicated_flux(
         "resampled_observed_residual": np.zeros(n_cadences, dtype=bool),
     }
     return rows, baseline_audit
+
+
+def _predictive_context(source: ValidatedPhase1DSource, draw: SelectedPosteriorDraw) -> _PredictiveContext:
+    _validate_draw_matches_source(source, draw)
+    physical = vector_to_physical(draw.vector, source.timing)
+    _validate_physical_matches_draw(draw, physical)
+    full_transit_model = transit_model_for_vector(draw.vector, source.data, source.config, source.timing)
+    return _PredictiveContext(
+        source=source,
+        draw=draw,
+        physical=physical,
+        full_transit_model=full_transit_model,
+    )
+
+
+def _validate_draw_matches_source(source: ValidatedPhase1DSource, draw: SelectedPosteriorDraw) -> None:
+    if draw.run_id != source.run_id:
+        raise ValueError(f"Selected draw run ID {draw.run_id!r} does not match source run ID {source.run_id!r}.")
+    if draw.mode != source.mode:
+        raise ValueError(f"Selected draw mode {draw.mode!r} does not match source mode {source.mode!r}.")
+    if draw.ensemble not in {ensemble.ensemble for ensemble in source.ensembles}:
+        raise ValueError(f"Selected draw ensemble {draw.ensemble} is not present in the validated source.")
+
+
+def _validate_physical_matches_draw(draw: SelectedPosteriorDraw, physical: Any) -> None:
+    recorded = asdict(draw.physical)
+    recalculated = asdict(physical)
+    for key, value in recorded.items():
+        if not np.isclose(float(value), float(recalculated[key]), rtol=0.0, atol=1.0e-12):
+            raise ValueError(f"Selected draw physical transform mismatch for {key}.")
 
 
 def write_development_predictive_output(

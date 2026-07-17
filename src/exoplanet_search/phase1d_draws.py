@@ -13,9 +13,8 @@ import pandas as pd
 
 from .phase1c import _validate_synthetic_input_record_if_needed, checkpoint_metadata, synthetic_dataset
 from .phase1c_inputs import load_frozen_phase1b
-from .phase1c_parameters import vector_to_physical
+from .phase1c_parameters import build_timing_reference, vector_to_physical
 from .phase1c_sampler import validate_checkpoint_metadata
-from .phase1c_parameters import build_timing_reference
 from .phase1c_types import PARAMETER_ORDER, FrozenPhase1BData, Phase1CConfig, PhysicalSample, TimingReference
 
 
@@ -56,6 +55,70 @@ class Phase1DSourcePolicy:
 
 
 @dataclass(frozen=True)
+class Phase1DSourceRequirements:
+    """Declared identity requirements for a Phase 1D source class."""
+
+    name: str
+    expected_run_id: str
+    expected_mode: str = "production"
+    n_ensembles: int = 4
+    n_walkers: int = 32
+    warmup_steps: int = 2000
+    supersample_factor: int = 11
+    limb_darkening_sigma_floor: float = 0.08
+    convergence_rhat_threshold: float = 1.01
+    convergence_ess_minimum: float = 1000.0
+    convergence_tau_multiple: float = 50.0
+    parameter_order: tuple[str, ...] = PARAMETER_ORDER
+
+    @classmethod
+    def primary(cls, expected_run_id: str) -> "Phase1DSourceRequirements":
+        return cls(name="phase1d_primary_posterior_v1", expected_run_id=expected_run_id)
+
+    def validate(self, config: Phase1CConfig, mode: str) -> dict[str, Any]:
+        expected = {
+            "run_id": self.expected_run_id,
+            "mode": self.expected_mode,
+            "n_ensembles": self.n_ensembles,
+            "n_walkers": self.n_walkers,
+            "warmup_steps": self.warmup_steps,
+            "supersample_factor": self.supersample_factor,
+            "limb_darkening_sigma_floor": self.limb_darkening_sigma_floor,
+            "convergence_rhat_threshold": self.convergence_rhat_threshold,
+            "convergence_ess_minimum": self.convergence_ess_minimum,
+            "convergence_tau_multiple": self.convergence_tau_multiple,
+            "parameter_order": list(self.parameter_order),
+        }
+        observed = {
+            "run_id": str(config.run_id),
+            "mode": mode,
+            "n_ensembles": int(config.n_ensembles),
+            "n_walkers": int(config.n_walkers),
+            "warmup_steps": int(config.warmup_steps),
+            "supersample_factor": int(config.supersample_factor),
+            "limb_darkening_sigma_floor": float(config.limb_darkening_sigma_floor),
+            "convergence_rhat_threshold": float(config.convergence_rhat_threshold),
+            "convergence_ess_minimum": float(config.convergence_ess_minimum),
+            "convergence_tau_multiple": float(config.convergence_tau_multiple),
+            "parameter_order": list(PARAMETER_ORDER),
+        }
+        mismatches = []
+        for key, expected_value in expected.items():
+            observed_value = observed[key]
+            if isinstance(expected_value, float):
+                matches = np.isclose(float(observed_value), expected_value, rtol=0.0, atol=1.0e-12)
+            else:
+                matches = observed_value == expected_value
+            if not matches:
+                mismatches.append({"field": key, "expected": expected_value, "observed": observed_value})
+        record = {"name": self.name, "expected": expected, "observed": observed, "mismatches": mismatches}
+        if mismatches:
+            fields = ", ".join(item["field"] for item in mismatches)
+            raise ValueError(f"Phase 1D source requirements mismatch for {self.name}: {fields}")
+        return record
+
+
+@dataclass(frozen=True)
 class EnsembleSource:
     """One validated Phase 1C HDF ensemble source."""
 
@@ -92,6 +155,7 @@ class ValidatedPhase1DSource:
     checkpoint_iterations: dict[str, int]
     input_provenance: dict[str, Any]
     policy: Phase1DSourcePolicy
+    requirements: dict[str, Any] | None
 
     @property
     def run_id(self) -> str:
@@ -169,7 +233,12 @@ def load_phase1c_config(run_dir: Path) -> Phase1CConfig:
     return type(config)(**{**config.__dict__, "output_dir": run_dir})
 
 
-def load_phase1d_source(run_dir: Path, policy: Phase1DSourcePolicy) -> ValidatedPhase1DSource:
+def load_phase1d_source(
+    run_dir: Path,
+    policy: Phase1DSourcePolicy,
+    *,
+    requirements: Phase1DSourceRequirements | None = None,
+) -> ValidatedPhase1DSource:
     """Validate and bind a Phase 1C source for Phase 1D draw access.
 
     Scientific Phase 1D posterior predictive execution requires a converged
@@ -180,6 +249,9 @@ def load_phase1d_source(run_dir: Path, policy: Phase1DSourcePolicy) -> Validated
     diagnostics = _read_json(run_dir / "sampler_diagnostics.json")
     mode = str(diagnostics.get("mode", ""))
     _validate_diagnostics_identity(diagnostics, config)
+    if policy.authoritative and requirements is None:
+        raise ValueError("Authoritative Phase 1D source loading requires explicit source requirements.")
+    requirements_record = requirements.validate(config, mode) if requirements is not None else None
     data, timing, input_provenance = _load_bound_data_and_timing(config, mode)
 
     metadata = checkpoint_metadata(data, config, mode=mode)
@@ -223,13 +295,8 @@ def load_phase1d_source(run_dir: Path, policy: Phase1DSourcePolicy) -> Validated
         checkpoint_iterations=checkpoint_iterations,
         input_provenance=input_provenance,
         policy=policy,
+        requirements=requirements_record,
     )
-
-
-def load_phase1c_draw_sources(run_dir: Path, policy: Phase1DSourcePolicy) -> tuple[Phase1CConfig, tuple[EnsembleSource, ...]]:
-    """Validate Phase 1C HDF files and return ensemble sources."""
-    source = load_phase1d_source(run_dir, policy)
-    return source.config, source.ensembles
 
 
 def select_posterior_draws(
@@ -305,6 +372,10 @@ def select_posterior_draws(
         "authoritative": source.policy.authoritative,
         "nonproduction_override": source.policy.allow_nonproduction or not source.policy.require_converged,
         "override_reason": source.policy.override_reason,
+        "source_requirements": source.requirements,
+        "input_identity": source.input_provenance,
+        "diagnostics_status": source.diagnostics.get("status"),
+        "source_git": _source_git_summary(source.run_dir),
         "selection_seed": seed,
         "requested_draws": requested_draws,
         "selected_draws": len(selected),
@@ -401,10 +472,18 @@ def _load_bound_data_and_timing(
     if mode in {"synthetic", "synthetic_recovery"}:
         data, timing, _ = synthetic_dataset(config)
         _validate_synthetic_input_record_if_needed(data, timing, config, mode)
-        return data, timing, {"synthetic_input_record": str(config.output_dir / "synthetic_input_record.json")}
+        return data, timing, {
+            "kind": "synthetic",
+            "manifest_sha256": data.input_manifest.get("manifest_sha256"),
+            "synthetic_input_record": str(config.output_dir / "synthetic_input_record.json"),
+        }
     data = load_frozen_phase1b(config)
     timing = build_timing_reference(data, config)
-    return data, timing, {"phase1b_input_manifest": data.input_manifest}
+    return data, timing, {
+        "kind": "phase1b",
+        "manifest_sha256": data.input_manifest.get("manifest_sha256"),
+        "phase1b_input_manifest": data.input_manifest,
+    }
 
 
 def _validate_authoritative_diagnostics(
@@ -431,6 +510,53 @@ def _validate_authoritative_diagnostics(
         raise ValueError("convergence_history.csv is stale relative to current HDF checkpoints.")
     if str(row.get("convergence_status", "")) != "converged":
         raise ValueError("Final convergence_history.csv row is not converged.")
+    _validate_authoritative_diagnostic_criteria(config, diagnostics, row)
+
+
+def _validate_authoritative_diagnostic_criteria(
+    config: Phase1CConfig,
+    diagnostics: dict[str, Any],
+    final_history_row: dict[str, Any],
+) -> None:
+    criteria = diagnostics.get("criteria")
+    if not isinstance(criteria, dict):
+        raise ValueError("sampler_diagnostics.json lacks convergence criteria mapping.")
+    required = (
+        "complete_valid_rhat",
+        "complete_valid_bulk_ess",
+        "complete_valid_tail_ess",
+        "rhat_all_below_threshold",
+        "ess_all_above_minimum",
+        "tail_ess_all_above_minimum",
+        "complete_valid_autocorrelation",
+        "chain_length_exceeds_tau_multiple",
+        "posterior_summary_stability",
+        "independent_ensemble_agreement",
+        "finite_log_probability_fraction_is_one",
+    )
+    missing = [key for key in required if key not in criteria]
+    if missing:
+        raise ValueError(f"sampler_diagnostics.json missing convergence criteria: {missing}")
+    false = [key for key in required if criteria[key] is not True]
+    if false:
+        raise ValueError(f"sampler_diagnostics.json convergence criteria are not all true: {false}")
+    if float(diagnostics.get("finite_log_probability_fraction", -1.0)) != 1.0:
+        raise ValueError("Authoritative diagnostics require finite_log_probability_fraction == 1.0.")
+    if float(final_history_row.get("rhat_max", np.inf)) >= float(config.convergence_rhat_threshold):
+        raise ValueError("Final convergence-history rhat_max does not satisfy saved threshold.")
+    if float(final_history_row.get("bulk_ess_min", -np.inf)) < float(config.convergence_ess_minimum):
+        raise ValueError("Final convergence-history bulk_ess_min does not satisfy saved minimum.")
+    if float(final_history_row.get("tail_ess_min", -np.inf)) < float(config.convergence_ess_minimum):
+        raise ValueError("Final convergence-history tail_ess_min does not satisfy saved minimum.")
+    history_flags = {
+        "posterior_stability_passed": "posterior stability",
+        "independent_ensemble_agreement_passed": "independent ensemble agreement",
+        "complete_valid_autocorrelation": "complete autocorrelation",
+        "chain_length_exceeds_tau_multiple": "chain length autocorrelation multiple",
+    }
+    for field, label in history_flags.items():
+        if _history_bool(final_history_row.get(field)) is not True:
+            raise ValueError(f"Final convergence-history row failed {label}.")
 
 
 def _final_convergence_history_row(run_dir: Path) -> dict[str, Any]:
@@ -441,6 +567,32 @@ def _final_convergence_history_row(run_dir: Path) -> dict[str, Any]:
     if frame.empty:
         raise ValueError(f"Empty convergence history: {path}")
     return frame.iloc[-1].to_dict()
+
+
+def _history_bool(value: Any) -> bool:
+    if pd.isna(value):
+        return False
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes"}
+    return bool(value)
+
+
+def _source_git_summary(run_dir: Path) -> dict[str, Any] | None:
+    path = run_dir / "provenance_manifest.json"
+    if not path.exists():
+        return None
+    try:
+        git = _read_json(path).get("git")
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(git, dict):
+        return None
+    return {
+        "commit": git.get("commit"),
+        "is_dirty": git.get("is_dirty"),
+    }
 
 
 def _parameter_order_from_attrs(hdf: h5py.File) -> list[str]:

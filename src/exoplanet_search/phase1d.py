@@ -32,6 +32,10 @@ class Phase1DDevelopmentConfig:
     predictive_seed: int = 2026071702
     allow_nonproduction_source: bool = True
 
+    def __post_init__(self) -> None:
+        if not 1 <= int(self.n_draws) <= 10:
+            raise ValueError("Phase 1D development n_draws must be between 1 and 10.")
+
 
 def run_phase1d_development_predictive(config: Phase1DDevelopmentConfig) -> dict[str, Any]:
     """Run a tiny nonauthoritative posterior-predictive development check.
@@ -40,6 +44,8 @@ def run_phase1d_development_predictive(config: Phase1DDevelopmentConfig) -> dict
     baseline draws, and cadence-aligned replicated flux. It cannot produce an
     authoritative Phase 1D posterior-predictive result.
     """
+    if not 1 <= int(config.n_draws) <= 10:
+        raise ValueError("Phase 1D development n_draws must be between 1 and 10.")
     run_id = _run_id(config)
     output_dir = config.output_dir / f"development_predictive_{run_id}"
     if output_dir.exists() and any(output_dir.iterdir()):
@@ -58,10 +64,8 @@ def run_phase1d_development_predictive(config: Phase1DDevelopmentConfig) -> dict
     baseline_rows = []
     for draw in selection.selected_draws:
         rows, baseline = generate_replicated_flux(
+            source,
             draw,
-            source.data,
-            source.config,
-            source.timing,
             rng,
             replication_index=len(predictive_rows),
         )

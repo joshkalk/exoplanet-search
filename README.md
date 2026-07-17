@@ -331,11 +331,13 @@ pass adds reusable, ensemble-aware posterior draw access and development-only
 posterior-predictive flux generation. A validated source object binds the
 Phase 1C run directory, saved configuration, mode, frozen or reconstructed
 data, derived timing reference, HDF ensembles, diagnostics, checkpoint
-metadata, and input provenance before draw selection. Callers do not supply an
-independent timing reference. It preserves the originating run ID, mode,
-selection position, ensemble, walker, and stored HDF step for every selected
-draw; the draw subset is a posterior-predictive Monte Carlo subset, not
-posterior thinning.
+metadata, input provenance, and any declared source requirements before draw
+selection or predictive generation. Public predictive entry points consume the
+validated source directly, so callers do not supply an independent timing
+reference, data table, or configuration. It preserves the originating run ID,
+mode, selection position, ensemble, walker, and stored HDF step for every
+selected draw; the draw subset is a posterior-predictive Monte Carlo subset,
+not posterior thinning.
 
 For each selected vector, Phase 1D reuses the Phase 1C transformations,
 BATMAN transit model, event-local coordinate, checkpoint metadata validation,
@@ -363,9 +365,19 @@ not resampled. Ensemble provenance is retained so later predictive checks can
 audit whether behavior is concentrated in one independent ensemble or shared
 across the posterior.
 
+Authoritative primary-source loading requires an explicit requirements record
+for the intended primary posterior, including the expected run ID, production
+mode, four ensembles, 32 walkers, 2000 warmup steps, supersampling factor 11,
+limb-darkening sigma floor 0.08, convergence thresholds, and the eight
+transformed-parameter order. It also verifies the complete Phase 1C convergence
+criteria, finite log-probability fraction, final convergence-history row,
+checkpoint iteration counts, stability, ensemble agreement, and
+autocorrelation criteria before allowing authoritative draw selection.
+
 A bounded development mode can exercise this plumbing against a small existing
 Phase 1C run. Its outputs are labeled nonauthoritative and must not be used as
-the scientific Phase 1D posterior-predictive analysis:
+the scientific Phase 1D posterior-predictive analysis. Development execution is
+capped at 1 to 10 selected draws:
 
 ```bash
 python -m exoplanet_search.cli --phase1d-development-predictive \
@@ -378,4 +390,7 @@ event-baseline draw audit, predictive configuration, and a compressed NPZ file
 with cadence-aligned replicated flux arrays. The NPZ and JSONL audit rows carry
 source run ID, source mode, selection position, predictive replication index,
 ensemble, walker, and stored step so every replicated cadence and event
-baseline can be traced back to its selected posterior draw.
+baseline can be traced back to its selected posterior draw. The selection
+manifest records requirement expected/observed values when present, input
+identity, checkpoint iterations, diagnostics status, available source Git
+state, and authoritative or override status.
