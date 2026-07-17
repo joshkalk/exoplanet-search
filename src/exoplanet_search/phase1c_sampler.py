@@ -54,6 +54,22 @@ class InitializationResult:
     summary: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class PriorInformedPoolResult:
+    """Adaptive broad-pool candidates and posterior eligibility audit."""
+
+    pool_vectors: np.ndarray
+    pool_log_prob: np.ndarray
+    finite_mask: np.ndarray
+    finite_indices: np.ndarray
+    deficits: np.ndarray
+    eligible_mask: np.ndarray
+    eligible_indices: np.ndarray
+    stage_history: list[dict[str, Any]]
+    expansion_count: int
+    stopping_reason: str
+
+
 class ProfiledLogPosterior:
     """Callable log-posterior wrapper used by emcee."""
 
@@ -264,24 +280,22 @@ def _build_prior_informed_initialization(
     center_logp = float(log_probability_with_context(center, context))
     maximum_deficit = float(config.prior_informed_max_logp_deficit)
     logp_floor = center_logp - maximum_deficit
-    pool_vectors = np.asarray(
-        [broad_prior_candidate(data, config, timing, rng) for _ in range(config.prior_informed_pool_size)],
-        dtype=float,
+    pool = _adaptive_prior_informed_candidate_pool(
+        data,
+        config,
+        timing,
+        rng,
+        context,
+        center_logp=center_logp,
     )
-    pool_log_prob = np.asarray([log_probability_with_context(candidate, context) for candidate in pool_vectors])
-    finite_mask = np.isfinite(pool_log_prob)
-    finite_indices = np.flatnonzero(finite_mask)
-    deficits = np.full(pool_log_prob.shape, np.inf, dtype=float)
-    deficits[finite_mask] = center_logp - pool_log_prob[finite_mask]
-    eligible_mask = finite_mask & (pool_log_prob >= logp_floor)
-    eligible_indices = np.flatnonzero(eligible_mask)
-    if eligible_indices.size < int(config.prior_informed_min_finite_candidates):
-        raise RuntimeError(
-            "Insufficient posterior-eligible broad prior-informed candidates: "
-            f"{eligible_indices.size} found, "
-            f"{config.prior_informed_min_finite_candidates} required."
-        )
-    eligible_order = eligible_indices[np.argsort(pool_log_prob[eligible_indices])[::-1]]
+    pool_vectors = pool.pool_vectors
+    pool_log_prob = pool.pool_log_prob
+    finite_mask = pool.finite_mask
+    finite_indices = pool.finite_indices
+    deficits = pool.deficits
+    eligible_mask = pool.eligible_mask
+    eligible_indices = pool.eligible_indices
+    eligible_order = eligible_indices[np.lexsort((eligible_indices, -pool_log_prob[eligible_indices]))]
     elite_size = min(int(config.prior_informed_elite_size), int(eligible_order.size))
     if elite_size <= 0:
         raise RuntimeError("Prior-informed elite set is empty after posterior eligibility screening.")
@@ -345,12 +359,22 @@ def _build_prior_informed_initialization(
         "timing_offsets": timing_offsets,
         "rank": rank,
         "prior_informed_remote_anchor": {
-            "algorithm": "broad_pool_elite_remote_anchor_v1",
-            "pool_size": int(config.prior_informed_pool_size),
+            "algorithm": "broad_pool_adaptive_expansion_v2",
+            "pool_size": int(pool_vectors.shape[0]),
+            "configured_initial_pool_size": int(config.prior_informed_pool_size),
+            "configured_maximum_pool_size": int(config.prior_informed_max_pool_size),
+            "configured_growth_factor": int(config.prior_informed_pool_growth_factor),
+            "actual_cumulative_candidates_evaluated": int(pool_vectors.shape[0]),
+            "expansion_count": int(pool.expansion_count),
+            "stopping_reason": pool.stopping_reason,
+            "required_eligible_candidate_count": int(config.prior_informed_min_finite_candidates),
             "pool_scale_multiplier": float(config.prior_informed_pool_scale_multiplier),
             "finite_candidate_count": int(finite_indices.size),
             "posterior_eligible_candidate_count": int(eligible_indices.size),
+            "eligible_fraction": float(eligible_indices.size / pool_vectors.shape[0]),
+            "stage_history": pool.stage_history,
             "finite_candidate_log_posterior_quantiles": _quantiles(pool_log_prob[finite_mask]),
+            "eligible_candidate_log_posterior_quantiles": _quantiles(pool_log_prob[eligible_mask]),
             "broad_candidate_log_posterior_deficits": [
                 None if not np.isfinite(value) else float(value) for value in deficits
             ],
@@ -378,6 +402,90 @@ def _build_prior_informed_initialization(
         },
     }
     return InitializationResult(walkers=walker_array, summary=summary)
+
+
+def _adaptive_prior_informed_candidate_pool(
+    data: FrozenPhase1BData,
+    config: Phase1CConfig,
+    timing: TimingReference,
+    rng: np.random.Generator,
+    context: Phase1CLikelihoodContext,
+    *,
+    center_logp: float,
+) -> PriorInformedPoolResult:
+    """Draw a nested broad candidate pool until the posterior eligibility rule is met."""
+    initial_size = int(config.prior_informed_pool_size)
+    max_size = int(config.prior_informed_max_pool_size)
+    growth_factor = int(config.prior_informed_pool_growth_factor)
+    required = int(config.prior_informed_min_finite_candidates)
+    maximum_deficit = float(config.prior_informed_max_logp_deficit)
+    logp_floor = float(center_logp) - maximum_deficit
+
+    pool_vectors: list[np.ndarray] = []
+    pool_log_prob: list[float] = []
+    stage_history: list[dict[str, Any]] = []
+    target_size = initial_size
+    stopping_reason = ""
+
+    while True:
+        previous_size = len(pool_vectors)
+        candidates_added = target_size - previous_size
+        for _ in range(candidates_added):
+            candidate = broad_prior_candidate(data, config, timing, rng)
+            pool_vectors.append(candidate)
+            pool_log_prob.append(float(log_probability_with_context(candidate, context)))
+
+        log_prob_array = np.asarray(pool_log_prob, dtype=float)
+        finite_mask = np.isfinite(log_prob_array)
+        eligible_mask = finite_mask & (log_prob_array >= logp_floor)
+        finite_count = int(np.sum(finite_mask))
+        eligible_count = int(np.sum(eligible_mask))
+        requirement_met = bool(eligible_count >= required)
+        stage_history.append(
+            {
+                "cumulative_pool_size": int(target_size),
+                "candidates_added": int(candidates_added),
+                "cumulative_finite_count": finite_count,
+                "cumulative_eligible_count": eligible_count,
+                "cumulative_eligible_fraction": float(eligible_count / target_size),
+                "stopping_requirement_met": requirement_met,
+            }
+        )
+        if requirement_met:
+            stopping_reason = "eligible_requirement_met"
+            break
+        if target_size >= max_size:
+            raise RuntimeError(
+                "Insufficient posterior-eligible broad prior-informed candidates after adaptive expansion: "
+                f"cumulative candidates evaluated={target_size}; "
+                f"finite candidate count={finite_count}; "
+                f"eligible candidate count={eligible_count}; "
+                f"required eligible count={required}; "
+                f"configured maximum log-posterior deficit={maximum_deficit}; "
+                f"center-relative log-posterior floor={logp_floor}; "
+                f"maximum pool size={max_size}; "
+                f"expansion stage history={stage_history}."
+            )
+        target_size = min(target_size * growth_factor, max_size)
+
+    vector_array = np.asarray(pool_vectors, dtype=float)
+    log_prob_array = np.asarray(pool_log_prob, dtype=float)
+    finite_mask = np.isfinite(log_prob_array)
+    deficits = np.full(log_prob_array.shape, np.inf, dtype=float)
+    deficits[finite_mask] = float(center_logp) - log_prob_array[finite_mask]
+    eligible_mask = finite_mask & (log_prob_array >= logp_floor)
+    return PriorInformedPoolResult(
+        pool_vectors=vector_array,
+        pool_log_prob=log_prob_array,
+        finite_mask=finite_mask,
+        finite_indices=np.flatnonzero(finite_mask),
+        deficits=deficits,
+        eligible_mask=eligible_mask,
+        eligible_indices=np.flatnonzero(eligible_mask),
+        stage_history=stage_history,
+        expansion_count=max(len(stage_history) - 1, 0),
+        stopping_reason=stopping_reason,
+    )
 
 
 def initial_walkers(

@@ -248,6 +248,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--phase1c-additional-steps", type=int, default=None)
     parser.add_argument("--phase1c-chunk-steps", type=int, default=12)
     parser.add_argument("--phase1c-warmup-steps", type=int, default=8)
+    parser.add_argument("--phase1c-prior-informed-max-pool-size", type=int, default=8192)
+    parser.add_argument("--phase1c-prior-informed-pool-growth-factor", type=int, default=2)
     parser.add_argument(
         "--phase1c-summarize-mode",
         choices=("pilot", "production", "synthetic", "synthetic_recovery"),
@@ -591,6 +593,8 @@ def _phase1c_config_from_args(args) -> Phase1CConfig:
         additional_steps=args.phase1c_additional_steps,
         chunk_steps=args.phase1c_chunk_steps,
         warmup_steps=args.phase1c_warmup_steps,
+        prior_informed_max_pool_size=args.phase1c_prior_informed_max_pool_size,
+        prior_informed_pool_growth_factor=args.phase1c_prior_informed_pool_growth_factor,
     )
 
 

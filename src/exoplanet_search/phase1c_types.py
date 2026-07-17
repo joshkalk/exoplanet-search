@@ -66,6 +66,8 @@ class Phase1CConfig:
     minimum_meaningful_summary_draws: int = 1000
     diagnostic_methodology_version: str = DIAGNOSTIC_METHODOLOGY_VERSION
     prior_informed_pool_size: int = 1024
+    prior_informed_max_pool_size: int = 8192
+    prior_informed_pool_growth_factor: int = 2
     prior_informed_pool_scale_multiplier: float = 0.8
     prior_informed_elite_size: int = 16
     prior_informed_min_finite_candidates: int = 8
@@ -96,10 +98,37 @@ class Phase1CConfig:
             )
         if int(self.autocorrelation_min_usable_walkers) < 2:
             raise ValueError("autocorrelation_min_usable_walkers must be at least 2.")
+        initial_pool_size = _require_integer(self.prior_informed_pool_size, "prior_informed_pool_size")
+        max_pool_size = _require_integer(
+            self.prior_informed_max_pool_size,
+            "prior_informed_max_pool_size",
+        )
+        growth_factor = _require_integer(
+            self.prior_informed_pool_growth_factor,
+            "prior_informed_pool_growth_factor",
+        )
+        required_candidates = _require_integer(
+            self.prior_informed_min_finite_candidates,
+            "prior_informed_min_finite_candidates",
+        )
+        elite_size = _require_integer(self.prior_informed_elite_size, "prior_informed_elite_size")
+        if initial_pool_size <= 0:
+            raise ValueError("prior_informed_pool_size must be positive.")
+        if max_pool_size < initial_pool_size:
+            raise ValueError("prior_informed_max_pool_size must be at least prior_informed_pool_size.")
+        if growth_factor < 2:
+            raise ValueError("prior_informed_pool_growth_factor must be an integer at least 2.")
+        if required_candidates <= 0:
+            raise ValueError("prior_informed_min_finite_candidates must be positive.")
+        if elite_size <= 0:
+            raise ValueError("prior_informed_elite_size must be positive.")
         if float(self.prior_informed_pool_scale_multiplier) <= 0.0:
             raise ValueError("prior_informed_pool_scale_multiplier must be positive.")
-        if float(self.prior_informed_max_logp_deficit) < 0.0:
-            raise ValueError("prior_informed_max_logp_deficit must be nonnegative.")
+        if (
+            not np.isfinite(float(self.prior_informed_max_logp_deficit))
+            or float(self.prior_informed_max_logp_deficit) <= 0.0
+        ):
+            raise ValueError("prior_informed_max_logp_deficit must be finite and positive.")
 
     def to_dict(self) -> dict[str, Any]:
         values = asdict(self)
@@ -122,6 +151,18 @@ class Phase1CConfig:
             ),
         }
         return values
+
+
+def _require_integer(value: Any, field_name: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be an integer.")
+    try:
+        integer = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be an integer.") from exc
+    if integer != value:
+        raise ValueError(f"{field_name} must be an integer.")
+    return integer
 
 
 @dataclass(frozen=True)
