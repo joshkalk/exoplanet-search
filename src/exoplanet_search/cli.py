@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from .config import (
+    DATA_INTERIM_DIR,
     DATA_RAW_DIR,
     DEFAULT_AUTHOR,
     DEFAULT_CADENCE,
@@ -46,6 +47,7 @@ from .phase1c import (
     validate_phase1c_inputs,
 )
 from .phase1c_types import Phase1CConfig
+from .phase1d import Phase1DDevelopmentConfig, run_phase1d_development_predictive
 from .preprocessing import PREPROCESSING_MODES, PreprocessingConfig, preprocess_light_curve
 from .provenance import build_provenance_manifest, write_json
 from .recovery import (
@@ -251,6 +253,17 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("pilot", "production", "synthetic", "synthetic_recovery"),
         default="pilot",
     )
+    parser.add_argument(
+        "--phase1d-development-predictive",
+        action="store_true",
+        help="Run a tiny nonauthoritative Phase 1D posterior-predictive development check.",
+    )
+    parser.add_argument("--phase1d-source-run-dir", type=Path, default=None)
+    parser.add_argument("--phase1d-output-dir", type=Path, default=DATA_INTERIM_DIR / "kepler5_phase1d")
+    parser.add_argument("--phase1d-run-id", default=None)
+    parser.add_argument("--phase1d-n-draws", type=int, default=2)
+    parser.add_argument("--phase1d-selection-seed", type=int, default=2026071701)
+    parser.add_argument("--phase1d-predictive-seed", type=int, default=2026071702)
     return parser
 
 
@@ -260,6 +273,9 @@ def main() -> None:
 
     if _phase1c_requested(args):
         _run_phase1c_from_args(args)
+        return
+    if args.phase1d_development_predictive:
+        _run_phase1d_from_args(args)
         return
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -610,6 +626,25 @@ def _run_phase1c_from_args(args) -> None:
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         raise SystemExit(f"Phase 1C {requested[0]} failed: {exc}") from exc
     print(f"Wrote Phase 1C {requested[0]} outputs under: {config.output_dir}")
+    print(json.dumps(result, indent=2))
+
+
+def _run_phase1d_from_args(args) -> None:
+    if args.phase1d_source_run_dir is None:
+        raise SystemExit("--phase1d-development-predictive requires --phase1d-source-run-dir.")
+    config = Phase1DDevelopmentConfig(
+        source_run_dir=args.phase1d_source_run_dir,
+        output_dir=args.phase1d_output_dir,
+        run_id=args.phase1d_run_id,
+        n_draws=args.phase1d_n_draws,
+        selection_seed=args.phase1d_selection_seed,
+        predictive_seed=args.phase1d_predictive_seed,
+    )
+    try:
+        result = run_phase1d_development_predictive(config)
+    except (FileNotFoundError, FileExistsError, ValueError, RuntimeError) as exc:
+        raise SystemExit(f"Phase 1D development predictive failed: {exc}") from exc
+    print(f"Wrote Phase 1D development predictive outputs under: {config.output_dir}")
     print(json.dumps(result, indent=2))
 
 

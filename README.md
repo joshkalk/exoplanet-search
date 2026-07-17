@@ -323,3 +323,47 @@ summaries, and basic trace/marginal/correlation plots when enough samples are
 available. Existing run directories are not overwritten unless resuming that
 specific run. The Phase 1B accepted cadences remain frozen and checksummed;
 Phase 1C rejects confirmed input mismatches rather than modifying that snapshot.
+
+## Phase 1D: posterior-predictive foundation
+
+Phase 1D starts from existing Phase 1C checkpoints. The first implementation
+pass adds reusable, ensemble-aware posterior draw access and development-only
+posterior-predictive flux generation. It preserves the originating run ID,
+ensemble, walker, and stored HDF step for every selected draw; the draw subset
+is a posterior-predictive Monte Carlo subset, not posterior thinning.
+
+For each selected vector, Phase 1D reuses the Phase 1C transformations,
+BATMAN transit model, event-local coordinate, and exact Gaussian marginalized
+event likelihood. The local multiplicative baseline design is
+`X = [m, m*x]`, where `m` is the exposure-integrated transit model and `x` is
+the deterministic event-local coordinate. Conditional baseline coefficients are
+drawn from:
+
+```text
+beta | y, theta ~ Normal(baseline_mean, baseline_covariance)
+```
+
+Replicated flux is generated at the frozen accepted cadences as:
+
+```text
+y_rep = X beta_draw + Normal(0, sigma_i^2 + jitter^2)
+```
+
+The predictive noise is newly generated from cadence uncertainty and sampled
+jitter; observed residuals are not resampled. Ensemble provenance is retained
+so later predictive checks can audit whether behavior is concentrated in one
+independent ensemble or shared across the posterior.
+
+A bounded development mode can exercise this plumbing against a small existing
+Phase 1C run. Its outputs are labeled nonauthoritative and must not be used as
+the scientific Phase 1D posterior-predictive analysis:
+
+```bash
+python -m exoplanet_search.cli --phase1d-development-predictive \
+  --phase1d-source-run-dir data/interim/kepler5_phase1c_posterior/synthetic-demo \
+  --phase1d-run-id dev-demo --phase1d-n-draws 2
+```
+
+Development outputs include a draw-selection manifest, selected-draw audit,
+event-baseline draw audit, predictive configuration, and a compressed NPZ file
+with cadence-aligned replicated flux arrays.
