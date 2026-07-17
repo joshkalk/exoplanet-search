@@ -386,7 +386,9 @@ def test_convergence_requires_complete_parameter_diagnostics(monkeypatch):
     )
 
     assert diagnostics["status"] == "nonconverged"
-    assert diagnostics["criteria"]["complete_valid_rhat"] is False
+    assert diagnostics["criteria"]["complete_valid_rhat"] is True
+    assert diagnostics["legacy_walker_as_chain_diagnostics"]["gating"] is False
+    assert math.isnan(diagnostics["legacy_walker_as_chain_diagnostics"]["split_rhat"][PARAMETER_ORDER[0]])
 
 
 def test_autocorrelation_rule_requires_every_ensemble_parameter(monkeypatch):

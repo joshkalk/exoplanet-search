@@ -262,6 +262,7 @@ def _stored_phase1c_config(config: Phase1CConfig) -> Phase1CConfig:
         "local_tight_scales",
         "local_moderate_scales",
         "local_broad_scales",
+        "prior_informed_cloud_scales",
     }
     for key in path_fields & set(payload):
         payload[key] = Path(payload[key])
@@ -719,8 +720,11 @@ def _append_convergence_history(
         "complete_valid_autocorrelation": diagnostics["criteria"]["complete_valid_autocorrelation"],
         "chain_length_exceeds_tau_multiple": diagnostics["criteria"]["chain_length_exceeds_tau_multiple"],
         "finite_log_probability_fraction_is_one": diagnostics["criteria"]["finite_log_probability_fraction_is_one"],
+        "no_severe_walker_pathology": diagnostics["criteria"]["no_severe_walker_pathology"],
+        "severe_walker_count": diagnostics["walker_health"]["severe_walker_count"],
         "diagnostic_backend": diagnostics["standard_diagnostic_backend"],
         "diagnostic_availability": diagnostics["standard_diagnostic_backend"],
+        "diagnostic_methodology_version": diagnostics["diagnostic_methodology_version"],
         "posterior_stability_passed": stability["passed"],
         "independent_ensemble_agreement_passed": agreement["passed"],
         "convergence_status": diagnostics["status"],
@@ -841,6 +845,7 @@ def build_phase1c_provenance(
         "phase1b_input_manifest": data.input_manifest,
         "phase1c_configuration": config.to_dict(),
         "checkpoint_metadata": checkpoint_metadata(data, config, mode=mode),
+        "diagnostic_methodology_version": config.diagnostic_methodology_version,
         "timing_reference": timing.__dict__,
         "cadence_count": data.cadence_count,
         "accepted_event_count": data.event_count,

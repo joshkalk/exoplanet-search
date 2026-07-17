@@ -20,6 +20,8 @@ PARAMETER_ORDER = (
     "mid_epoch_offset",
 )
 
+DIAGNOSTIC_METHODOLOGY_VERSION = "phase1c_emcee_ensemble_state_v2"
+
 
 @dataclass(frozen=True)
 class Phase1CConfig:
@@ -57,11 +59,32 @@ class Phase1CConfig:
     convergence_stability_sigma_threshold: float = 0.25
     convergence_ensemble_shift_threshold: float = 3.0
     convergence_interval_overlap_minimum: float = 0.25
+    convergence_tail_interval_overlap_minimum: float = 0.25
+    convergence_ensemble_scale_ratio_max: float = 3.0
     max_pilot_seconds: float = 600.0
     minimum_meaningful_summary_draws: int = 1000
+    diagnostic_methodology_version: str = DIAGNOSTIC_METHODOLOGY_VERSION
+    prior_informed_pool_size: int = 512
+    prior_informed_elite_size: int = 16
+    prior_informed_min_finite_candidates: int = 16
+    prior_informed_cloud_logp_drop: float = 30.0
     local_tight_scales: tuple[float, ...] = (0.015, 0.02, 0.015, 0.015, 0.015, 0.05, 1.0e-5, 2.0e-4)
     local_moderate_scales: tuple[float, ...] = (0.04, 0.05, 0.04, 0.04, 0.04, 0.12, 5.0e-5, 1.0e-3)
     local_broad_scales: tuple[float, ...] = (0.08, 0.10, 0.08, 0.08, 0.08, 0.25, 2.0e-4, 5.0e-3)
+    prior_informed_cloud_scales: tuple[float, ...] = (
+        0.06,
+        0.075,
+        0.06,
+        0.06,
+        0.06,
+        0.18,
+        1.0e-4,
+        2.0e-3,
+    )
+    severe_walker_acceptance_max: float = 0.05
+    severe_walker_repeated_fraction_min: float = 0.95
+    severe_walker_logp_deficit_min: float = 100.0
+    severe_walker_final_distance_min: float = 25.0
 
     def to_dict(self) -> dict[str, Any]:
         values = asdict(self)
@@ -77,6 +100,11 @@ class Phase1CConfig:
             "jitter_prior": "Half-normal in physical jitter; sampled in log jitter with Jacobian.",
             "baseline_marginalization": "Exact Gaussian marginalization per event.",
             "pilot_label": "PILOT - NONPRODUCTION - NONCONVERGED",
+            "diagnostic_methodology": DIAGNOSTIC_METHODOLOGY_VERSION,
+            "prior_informed_initialization": (
+                "Broad prior pool is posterior-screened to select one remote anchor, then walkers "
+                "start as a coherent local cloud around that anchor."
+            ),
         }
         return values
 

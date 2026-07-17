@@ -209,18 +209,17 @@ def build_initialization(
     """Generate initial walkers and diagnostics for one strategy."""
     likelihood_context = context or Phase1CLikelihoodContext.from_data(data, config, timing)
     center = deterministic_center_vector(data, config, timing)
+    if strategy.startswith(PRIOR_STRATEGY):
+        return _build_prior_informed_initialization(data, config, timing, rng, seed, likelihood_context, center)
     walkers: list[np.ndarray] = []
     initial_log_prob: list[float] = []
     redraws = 0
     tries = 0
     while len(walkers) < config.n_walkers and tries < config.n_walkers * 1000:
         tries += 1
-        if strategy.startswith(PRIOR_STRATEGY):
-            candidate = broad_prior_candidate(data, config, timing, rng)
-        else:
-            scales = initialization_scales(config, strategy)
-            candidate = center + rng.normal(0.0, scales)
-            candidate = _clip_local_candidate(candidate, config, timing)
+        scales = initialization_scales(config, strategy)
+        candidate = center + rng.normal(0.0, scales)
+        candidate = _clip_local_candidate(candidate, config, timing)
         value = log_probability_with_context(candidate, likelihood_context)
         if np.isfinite(value):
             walkers.append(candidate)
@@ -249,6 +248,121 @@ def build_initialization(
         "redraws": int(redraws),
         "timing_offsets": timing_offsets,
         "rank": int(np.linalg.matrix_rank(walker_array - np.mean(walker_array, axis=0))),
+    }
+    return InitializationResult(walkers=walker_array, summary=summary)
+
+
+def _build_prior_informed_initialization(
+    data: FrozenPhase1BData,
+    config: Phase1CConfig,
+    timing: TimingReference,
+    rng: np.random.Generator,
+    seed: int,
+    context: Phase1CLikelihoodContext,
+    center: np.ndarray,
+) -> InitializationResult:
+    """Build a coherent remote-start cloud selected from broad posterior-screened draws."""
+    pool_vectors = np.asarray(
+        [broad_prior_candidate(data, config, timing, rng) for _ in range(config.prior_informed_pool_size)],
+        dtype=float,
+    )
+    pool_log_prob = np.asarray([log_probability_with_context(candidate, context) for candidate in pool_vectors])
+    finite_mask = np.isfinite(pool_log_prob)
+    finite_indices = np.flatnonzero(finite_mask)
+    fallback_used = False
+    fallback_reason = None
+    if finite_indices.size:
+        finite_order = finite_indices[np.argsort(pool_log_prob[finite_indices])[::-1]]
+        elite_size = min(int(config.prior_informed_elite_size), int(finite_order.size))
+        elite_indices = finite_order[:elite_size]
+    else:
+        elite_size = 0
+        elite_indices = np.asarray([], dtype=int)
+    if finite_indices.size < config.prior_informed_min_finite_candidates or elite_size == 0:
+        fallback_used = True
+        fallback_reason = "insufficient_finite_broad_candidates"
+        if finite_indices.size:
+            anchor_index = int(finite_indices[np.argmax(pool_log_prob[finite_indices])])
+            anchor = pool_vectors[anchor_index].copy()
+            anchor_logp = float(pool_log_prob[anchor_index])
+        else:
+            anchor_index = None
+            anchor = center.copy()
+            anchor_logp = float(log_probability_with_context(anchor, context))
+    else:
+        normalized = _normalized_distance(pool_vectors[elite_indices], center, np.asarray(config.local_broad_scales))
+        best_local = int(np.argmax(normalized))
+        anchor_index = int(elite_indices[best_local])
+        anchor = pool_vectors[anchor_index].copy()
+        anchor_logp = float(pool_log_prob[anchor_index])
+
+    scales = np.asarray(config.prior_informed_cloud_scales, dtype=float)
+    if scales.shape != (len(PARAMETER_ORDER),):
+        raise ValueError(f"prior_informed_cloud_scales must have {len(PARAMETER_ORDER)} entries.")
+    walkers: list[np.ndarray] = [anchor.copy()]
+    initial_log_prob: list[float] = [anchor_logp]
+    redraws = 0
+    tries = 0
+    max_tries = config.n_walkers * 2000
+    lower_logp = anchor_logp - float(config.prior_informed_cloud_logp_drop)
+    while len(walkers) < config.n_walkers and tries < max_tries:
+        tries += 1
+        candidate = _clip_local_candidate(anchor + rng.normal(0.0, scales), config, timing)
+        value = log_probability_with_context(candidate, context)
+        if np.isfinite(value) and float(value) >= lower_logp:
+            walkers.append(candidate)
+            initial_log_prob.append(float(value))
+        else:
+            redraws += 1
+    if len(walkers) != config.n_walkers:
+        raise RuntimeError("Could not generate enough posterior-screened prior-informed walkers.")
+    walker_array = np.asarray(walkers, dtype=float)
+    log_prob_array = np.asarray(initial_log_prob, dtype=float)
+    rank = int(np.linalg.matrix_rank(walker_array - np.mean(walker_array, axis=0)))
+    if rank != len(PARAMETER_ORDER):
+        raise RuntimeError("Prior-informed walker cloud is not full rank.")
+    distances = _normalized_distance(walker_array, center, np.asarray(config.local_broad_scales))
+    anchor_rank = None
+    if anchor_index is not None and finite_indices.size:
+        anchor_rank = int(np.where(finite_order == anchor_index)[0][0] + 1)
+    timing_offsets = {
+        "period_offset": _min_median_max(walker_array[:, 6]),
+        "mid_epoch_offset": _min_median_max(walker_array[:, 7]),
+    }
+    summary = {
+        "strategy": PRIOR_STRATEGY,
+        "seed": int(seed),
+        "center": _parameter_dict(center),
+        "configured_scales": _parameter_dict(scales),
+        "actual_distance_from_deterministic_center": _min_median_max(distances),
+        "initial_finite_log_probability_fraction": float(np.mean(np.isfinite(log_prob_array))),
+        "initial_log_posterior": _min_median_max(log_prob_array),
+        "redraws": int(redraws),
+        "timing_offsets": timing_offsets,
+        "rank": rank,
+        "prior_informed_remote_anchor": {
+            "algorithm": "broad_pool_elite_remote_anchor_v1",
+            "pool_size": int(config.prior_informed_pool_size),
+            "finite_candidate_count": int(finite_indices.size),
+            "finite_candidate_log_posterior_quantiles": _quantiles(pool_log_prob[finite_mask]),
+            "elite_rule": "highest posterior finite candidates, then largest normalized distance from deterministic center",
+            "elite_size_configured": int(config.prior_informed_elite_size),
+            "elite_size_used": int(elite_size),
+            "selected_anchor_pool_index": anchor_index,
+            "selected_anchor_rank_by_log_posterior": anchor_rank,
+            "selected_anchor_vector": _parameter_dict(anchor),
+            "selected_anchor_log_posterior": anchor_logp,
+            "selected_anchor_normalized_distance_from_center": float(
+                _normalized_distance(anchor[None, :], center, np.asarray(config.local_broad_scales))[0]
+            ),
+            "cloud_log_posterior_floor": float(lower_logp),
+            "cloud_log_posterior_drop_allowed": float(config.prior_informed_cloud_logp_drop),
+            "cloud_log_posterior_range": _min_median_max(log_prob_array),
+            "cloud_scales": _parameter_dict(scales),
+            "fallback_used": bool(fallback_used),
+            "fallback_reason": fallback_reason,
+            "full_rank": bool(rank == len(PARAMETER_ORDER)),
+        },
     }
     return InitializationResult(walkers=walker_array, summary=summary)
 
@@ -563,6 +677,26 @@ def _min_median_max(values: np.ndarray) -> dict[str, float]:
         "median": float(np.median(values)),
         "max": float(np.max(values)),
     }
+
+
+def _quantiles(values: np.ndarray) -> dict[str, float | None]:
+    finite = np.asarray(values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return {"q05": None, "q16": None, "q50": None, "q84": None, "q95": None}
+    q05, q16, q50, q84, q95 = np.quantile(finite, [0.05, 0.16, 0.50, 0.84, 0.95])
+    return {
+        "q05": float(q05),
+        "q16": float(q16),
+        "q50": float(q50),
+        "q84": float(q84),
+        "q95": float(q95),
+    }
+
+
+def _normalized_distance(values: np.ndarray, center: np.ndarray, scales: np.ndarray) -> np.ndarray:
+    safe_scales = np.maximum(np.asarray(scales, dtype=float), 1.0e-12)
+    return np.linalg.norm((np.asarray(values, dtype=float) - np.asarray(center, dtype=float)) / safe_scales, axis=1)
 
 
 def _resume_initialization_summary(strategy: str, seed: int) -> dict[str, Any]:

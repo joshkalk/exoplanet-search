@@ -15,7 +15,7 @@ from exoplanet_search import phase1d_draws as draws_module
 from exoplanet_search.phase1c import _synthetic_input_record, checkpoint_metadata, synthetic_dataset
 from exoplanet_search.phase1c_parameters import vector_to_physical
 from exoplanet_search.phase1c_sampler import write_checkpoint_metadata
-from exoplanet_search.phase1c_types import PARAMETER_ORDER, Phase1CConfig
+from exoplanet_search.phase1c_types import DIAGNOSTIC_METHODOLOGY_VERSION, PARAMETER_ORDER, Phase1CConfig
 from exoplanet_search.phase1d import Phase1DDevelopmentConfig, run_phase1d_development_predictive
 from exoplanet_search.phase1d_draws import (
     Phase1DSourceRequirements,
@@ -581,8 +581,10 @@ def _write_convergence_history(
                 "tail_ess_min": tail_ess,
                 "posterior_stability_passed": posterior_stability_passed,
                 "independent_ensemble_agreement_passed": independent_ensemble_agreement_passed,
+                "no_severe_walker_pathology": True,
                 "complete_valid_autocorrelation": complete_valid_autocorrelation,
                 "chain_length_exceeds_tau_multiple": chain_length_exceeds_tau_multiple,
+                "diagnostic_methodology_version": DIAGNOSTIC_METHODOLOGY_VERSION,
                 "convergence_status": status,
             }
         ]
@@ -602,11 +604,13 @@ def _diagnostics_payload(config, mode, status):
         "posterior_summary_stability": True,
         "independent_ensemble_agreement": True,
         "finite_log_probability_fraction_is_one": True,
+        "no_severe_walker_pathology": True,
     }
     return {
         "status": status,
         "mode": mode,
         "run_id": config.run_id,
+        "diagnostic_methodology_version": DIAGNOSTIC_METHODOLOGY_VERSION,
         "criteria": criteria,
         "finite_log_probability_fraction": 1.0,
         "split_rhat": {name: 1.0 for name in PARAMETER_ORDER},
