@@ -15,7 +15,12 @@ import emcee
 import h5py
 import numpy as np
 
-from .phase1c_likelihood import PosteriorProfiler, log_probability, profiled_log_probability
+from .phase1c_likelihood import (
+    Phase1CLikelihoodContext,
+    PosteriorProfiler,
+    log_probability_with_context,
+    profiled_log_probability_with_context,
+)
 from .phase1c_parameters import (
     deterministic_physical_sample,
     jitter_prior_scale,
@@ -55,18 +60,14 @@ class ProfiledLogPosterior:
 
     def __init__(
         self,
-        data: FrozenPhase1BData,
-        config: Phase1CConfig,
-        timing: TimingReference,
+        context: Phase1CLikelihoodContext,
         profiler: PosteriorProfiler,
     ) -> None:
-        self.data = data
-        self.config = config
-        self.timing = timing
+        self.context = context
         self.profiler = profiler
 
     def __call__(self, vector: np.ndarray) -> float:
-        return profiled_log_probability(vector, self.data, self.config, self.timing, self.profiler)
+        return profiled_log_probability_with_context(vector, self.context, self.profiler)
 
 
 def run_ensembles(
@@ -85,6 +86,7 @@ def run_ensembles(
     output_dir = config.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     metadata = checkpoint_metadata(data, config, mode=mode)
+    likelihood_context = Phase1CLikelihoodContext.from_data(data, config, timing)
 
     samplers = []
     profilers = []
@@ -108,7 +110,7 @@ def run_ensembles(
         sampler = emcee.EnsembleSampler(
             config.n_walkers,
             len(PARAMETER_ORDER),
-            ProfiledLogPosterior(data, config, timing, profiler),
+            ProfiledLogPosterior(likelihood_context, profiler),
             backend=backend,
         )
         rng = np.random.default_rng(seed)
@@ -116,7 +118,15 @@ def run_ensembles(
             initial_state = None
             initialization_summary = _resume_initialization_summary(strategy, seed)
         else:
-            initialization = build_initialization(data, config, timing, rng, strategy, seed)
+            initialization = build_initialization(
+                data,
+                config,
+                timing,
+                rng,
+                strategy,
+                seed,
+                context=likelihood_context,
+            )
             initial_state = initialization.walkers
             initialization_summary = initialization.summary
         samplers.append(sampler)
@@ -193,8 +203,11 @@ def build_initialization(
     rng: np.random.Generator,
     strategy: str,
     seed: int,
+    *,
+    context: Phase1CLikelihoodContext | None = None,
 ) -> InitializationResult:
     """Generate initial walkers and diagnostics for one strategy."""
+    likelihood_context = context or Phase1CLikelihoodContext.from_data(data, config, timing)
     center = deterministic_center_vector(data, config, timing)
     walkers: list[np.ndarray] = []
     initial_log_prob: list[float] = []
@@ -208,7 +221,7 @@ def build_initialization(
             scales = initialization_scales(config, strategy)
             candidate = center + rng.normal(0.0, scales)
             candidate = _clip_local_candidate(candidate, config, timing)
-        value = log_probability(candidate, data, config, timing)
+        value = log_probability_with_context(candidate, likelihood_context)
         if np.isfinite(value):
             walkers.append(candidate)
             initial_log_prob.append(float(value))
