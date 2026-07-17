@@ -23,7 +23,6 @@ from .phase1c_likelihood import (
 )
 from .phase1c_parameters import (
     deterministic_physical_sample,
-    jitter_prior_scale,
     physical_to_vector,
 )
 from .phase1c_types import FrozenPhase1BData, PARAMETER_ORDER, Phase1CConfig, TimingReference
@@ -262,6 +261,9 @@ def _build_prior_informed_initialization(
     center: np.ndarray,
 ) -> InitializationResult:
     """Build a coherent remote-start cloud selected from broad posterior-screened draws."""
+    center_logp = float(log_probability_with_context(center, context))
+    maximum_deficit = float(config.prior_informed_max_logp_deficit)
+    logp_floor = center_logp - maximum_deficit
     pool_vectors = np.asarray(
         [broad_prior_candidate(data, config, timing, rng) for _ in range(config.prior_informed_pool_size)],
         dtype=float,
@@ -269,51 +271,52 @@ def _build_prior_informed_initialization(
     pool_log_prob = np.asarray([log_probability_with_context(candidate, context) for candidate in pool_vectors])
     finite_mask = np.isfinite(pool_log_prob)
     finite_indices = np.flatnonzero(finite_mask)
-    fallback_used = False
-    fallback_reason = None
-    if finite_indices.size:
-        finite_order = finite_indices[np.argsort(pool_log_prob[finite_indices])[::-1]]
-        elite_size = min(int(config.prior_informed_elite_size), int(finite_order.size))
-        elite_indices = finite_order[:elite_size]
-    else:
-        elite_size = 0
-        elite_indices = np.asarray([], dtype=int)
-    if finite_indices.size < config.prior_informed_min_finite_candidates or elite_size == 0:
-        fallback_used = True
-        fallback_reason = "insufficient_finite_broad_candidates"
-        if finite_indices.size:
-            anchor_index = int(finite_indices[np.argmax(pool_log_prob[finite_indices])])
-            anchor = pool_vectors[anchor_index].copy()
-            anchor_logp = float(pool_log_prob[anchor_index])
-        else:
-            anchor_index = None
-            anchor = center.copy()
-            anchor_logp = float(log_probability_with_context(anchor, context))
-    else:
-        normalized = _normalized_distance(pool_vectors[elite_indices], center, np.asarray(config.local_broad_scales))
-        best_local = int(np.argmax(normalized))
-        anchor_index = int(elite_indices[best_local])
-        anchor = pool_vectors[anchor_index].copy()
-        anchor_logp = float(pool_log_prob[anchor_index])
+    deficits = np.full(pool_log_prob.shape, np.inf, dtype=float)
+    deficits[finite_mask] = center_logp - pool_log_prob[finite_mask]
+    eligible_mask = finite_mask & (pool_log_prob >= logp_floor)
+    eligible_indices = np.flatnonzero(eligible_mask)
+    if eligible_indices.size < int(config.prior_informed_min_finite_candidates):
+        raise RuntimeError(
+            "Insufficient posterior-eligible broad prior-informed candidates: "
+            f"{eligible_indices.size} found, "
+            f"{config.prior_informed_min_finite_candidates} required."
+        )
+    eligible_order = eligible_indices[np.argsort(pool_log_prob[eligible_indices])[::-1]]
+    elite_size = min(int(config.prior_informed_elite_size), int(eligible_order.size))
+    if elite_size <= 0:
+        raise RuntimeError("Prior-informed elite set is empty after posterior eligibility screening.")
+    elite_indices = eligible_order[:elite_size]
+    normalized = _normalized_distance(pool_vectors[elite_indices], center, np.asarray(config.local_broad_scales))
+    best_local = int(np.argmax(normalized))
+    anchor_index = int(elite_indices[best_local])
+    anchor = pool_vectors[anchor_index].copy()
+    anchor_logp = float(pool_log_prob[anchor_index])
+    anchor_deficit = float(center_logp - anchor_logp)
+    if anchor_deficit > maximum_deficit or not np.isfinite(anchor_logp):
+        raise RuntimeError("Selected prior-informed anchor failed posterior eligibility screening.")
+    if np.array_equal(anchor, center):
+        raise RuntimeError("Prior-informed anchor unexpectedly equals deterministic center.")
 
     scales = np.asarray(config.prior_informed_cloud_scales, dtype=float)
     if scales.shape != (len(PARAMETER_ORDER),):
         raise ValueError(f"prior_informed_cloud_scales must have {len(PARAMETER_ORDER)} entries.")
     walkers: list[np.ndarray] = [anchor.copy()]
     initial_log_prob: list[float] = [anchor_logp]
-    redraws = 0
+    rejection_counts = {"nonfinite": 0, "below_floor": 0}
     tries = 0
     max_tries = config.n_walkers * 2000
-    lower_logp = anchor_logp - float(config.prior_informed_cloud_logp_drop)
     while len(walkers) < config.n_walkers and tries < max_tries:
         tries += 1
         candidate = _clip_local_candidate(anchor + rng.normal(0.0, scales), config, timing)
         value = log_probability_with_context(candidate, context)
-        if np.isfinite(value) and float(value) >= lower_logp:
+        if np.isfinite(value) and float(value) >= logp_floor:
             walkers.append(candidate)
             initial_log_prob.append(float(value))
         else:
-            redraws += 1
+            if not np.isfinite(value):
+                rejection_counts["nonfinite"] += 1
+            else:
+                rejection_counts["below_floor"] += 1
     if len(walkers) != config.n_walkers:
         raise RuntimeError("Could not generate enough posterior-screened prior-informed walkers.")
     walker_array = np.asarray(walkers, dtype=float)
@@ -323,8 +326,9 @@ def _build_prior_informed_initialization(
         raise RuntimeError("Prior-informed walker cloud is not full rank.")
     distances = _normalized_distance(walker_array, center, np.asarray(config.local_broad_scales))
     anchor_rank = None
-    if anchor_index is not None and finite_indices.size:
-        anchor_rank = int(np.where(finite_order == anchor_index)[0][0] + 1)
+    if eligible_indices.size:
+        anchor_rank = int(np.where(eligible_order == anchor_index)[0][0] + 1)
+    log_prob_deficits = center_logp - log_prob_array
     timing_offsets = {
         "period_offset": _min_median_max(walker_array[:, 6]),
         "mid_epoch_offset": _min_median_max(walker_array[:, 7]),
@@ -337,14 +341,21 @@ def _build_prior_informed_initialization(
         "actual_distance_from_deterministic_center": _min_median_max(distances),
         "initial_finite_log_probability_fraction": float(np.mean(np.isfinite(log_prob_array))),
         "initial_log_posterior": _min_median_max(log_prob_array),
-        "redraws": int(redraws),
+        "redraws": int(sum(rejection_counts.values())),
         "timing_offsets": timing_offsets,
         "rank": rank,
         "prior_informed_remote_anchor": {
             "algorithm": "broad_pool_elite_remote_anchor_v1",
             "pool_size": int(config.prior_informed_pool_size),
+            "pool_scale_multiplier": float(config.prior_informed_pool_scale_multiplier),
             "finite_candidate_count": int(finite_indices.size),
+            "posterior_eligible_candidate_count": int(eligible_indices.size),
             "finite_candidate_log_posterior_quantiles": _quantiles(pool_log_prob[finite_mask]),
+            "broad_candidate_log_posterior_deficits": [
+                None if not np.isfinite(value) else float(value) for value in deficits
+            ],
+            "deterministic_center_log_posterior": center_logp,
+            "maximum_log_posterior_deficit": maximum_deficit,
             "elite_rule": "highest posterior finite candidates, then largest normalized distance from deterministic center",
             "elite_size_configured": int(config.prior_informed_elite_size),
             "elite_size_used": int(elite_size),
@@ -352,15 +363,17 @@ def _build_prior_informed_initialization(
             "selected_anchor_rank_by_log_posterior": anchor_rank,
             "selected_anchor_vector": _parameter_dict(anchor),
             "selected_anchor_log_posterior": anchor_logp,
+            "selected_anchor_log_posterior_deficit": anchor_deficit,
             "selected_anchor_normalized_distance_from_center": float(
                 _normalized_distance(anchor[None, :], center, np.asarray(config.local_broad_scales))[0]
             ),
-            "cloud_log_posterior_floor": float(lower_logp),
-            "cloud_log_posterior_drop_allowed": float(config.prior_informed_cloud_logp_drop),
+            "cloud_log_posterior_floor": float(logp_floor),
+            "cloud_minimum_log_posterior_deficit": float(np.max(log_prob_deficits)),
             "cloud_log_posterior_range": _min_median_max(log_prob_array),
             "cloud_scales": _parameter_dict(scales),
-            "fallback_used": bool(fallback_used),
-            "fallback_reason": fallback_reason,
+            "rejection_counts": {key: int(value) for key, value in rejection_counts.items()},
+            "fallback_used": False,
+            "fallback_reason": None,
             "full_rank": bool(rank == len(PARAMETER_ORDER)),
         },
     }
@@ -421,28 +434,9 @@ def broad_prior_candidate(
     rng: np.random.Generator,
 ) -> np.ndarray:
     """Draw a broad prior-informed candidate in transformed coordinates."""
-    rp = rng.uniform(*config.rp_bounds)
-    lower_a = max(config.a_bounds[0], 1.0 + rp + 1.0e-4)
-    log_a = rng.uniform(np.log(lower_a), np.log(config.a_bounds[1]))
-    jitter_scale = 0.5 * (np.log(config.jitter_upper) - np.log(config.jitter_lower))
-    log_jitter = np.clip(
-        np.log(jitter_prior_scale(data, config)) + rng.normal(0.0, jitter_scale),
-        np.log(config.jitter_lower * 1.01),
-        np.log(config.jitter_upper * 0.9),
-    )
-    return np.asarray(
-        [
-            np.log(rp),
-            log_a,
-            rng.uniform(0.0, 1.0),
-            rng.uniform(*config.q_bounds),
-            rng.uniform(*config.q_bounds),
-            log_jitter,
-            rng.uniform(-0.9 * timing.period_half_width, 0.9 * timing.period_half_width),
-            rng.uniform(-0.9 * timing.mid_epoch_half_width, 0.9 * timing.mid_epoch_half_width),
-        ],
-        dtype=float,
-    )
+    center = deterministic_center_vector(data, config, timing)
+    scales = float(config.prior_informed_pool_scale_multiplier) * np.asarray(config.local_broad_scales, dtype=float)
+    return _clip_local_candidate(center + rng.normal(0.0, scales), config, timing)
 
 
 def load_backend_chains(results: list[EnsembleRunResult]) -> tuple[np.ndarray, np.ndarray]:
@@ -475,7 +469,7 @@ def estimate_autocorrelation_time(results: list[EnsembleRunResult], warmup_steps
         estimate = None
         error = None
         try:
-            estimate = backend.get_autocorr_time(discard=warmup_steps, quiet=True)
+            estimate = backend.get_autocorr_time(discard=warmup_steps, quiet=False)
         except (emcee.autocorr.AutocorrError, ValueError, FloatingPointError, IndexError) as exc:
             error = str(exc)
         for parameter_index, parameter in enumerate(PARAMETER_ORDER):
@@ -658,6 +652,10 @@ def _clip_local_candidate(
     timing: TimingReference,
 ) -> np.ndarray:
     clipped = np.asarray(candidate, dtype=float).copy()
+    rp = float(np.clip(np.exp(clipped[0]), config.rp_bounds[0], config.rp_bounds[1]))
+    clipped[0] = np.log(rp)
+    lower_a = max(config.a_bounds[0], 1.0 + rp + 1.0e-4)
+    clipped[1] = np.clip(clipped[1], np.log(lower_a), np.log(config.a_bounds[1]))
     clipped[2] = np.clip(clipped[2], 1.0e-4, 0.999)
     clipped[3] = np.clip(clipped[3], 1.0e-4, 0.999)
     clipped[4] = np.clip(clipped[4], 1.0e-4, 0.999)

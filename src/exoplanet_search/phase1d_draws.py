@@ -240,6 +240,9 @@ def load_phase1c_config(run_dir: Path) -> Phase1CConfig:
     ):
         if key in payload:
             payload[key] = tuple(payload[key])
+    if "prior_informed_cloud_logp_drop" in payload:
+        payload.setdefault("prior_informed_max_logp_deficit", payload["prior_informed_cloud_logp_drop"])
+        payload.pop("prior_informed_cloud_logp_drop", None)
     config = Phase1CConfig(**payload)
     return type(config)(**{**config.__dict__, "output_dir": run_dir})
 

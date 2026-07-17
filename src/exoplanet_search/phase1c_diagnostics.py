@@ -104,7 +104,11 @@ def independent_ensemble_state_rhat(ensemble_chain: np.ndarray) -> dict[str, Any
     }
 
 
-def emcee_rank_bulk_ess(ensemble_chain: np.ndarray) -> dict[str, Any]:
+def emcee_rank_bulk_ess(
+    ensemble_chain: np.ndarray,
+    *,
+    min_usable_walkers: int = 2,
+) -> dict[str, Any]:
     """Estimate bulk ESS from rank-normalized emcee ensemble autocorrelation times."""
     rows = []
     combined = {}
@@ -113,18 +117,26 @@ def emcee_rank_bulk_ess(ensemble_chain: np.ndarray) -> dict[str, Any]:
         ranked = _rank_normalize_values(ensemble_chain[:, :, :, parameter_index])
         parameter_ess = []
         for ensemble_index in range(ranked.shape[0]):
-            estimate = _emcee_tau(ranked[ensemble_index].T, allow_constant=True)
+            estimate = _emcee_tau(
+                ranked[ensemble_index].T,
+                min_usable_walkers=min_usable_walkers,
+            )
             row = {
                 "ensemble": int(ensemble_index),
                 "parameter": parameter,
                 "tau": estimate["tau"],
                 "available": estimate["available"],
-                "retained_samples": int(ranked.shape[1] * ranked.shape[2]),
+                "retained_steps": estimate["retained_steps"],
+                "total_walkers": estimate["total_walkers"],
+                "usable_walkers": estimate["usable_walkers"],
+                "retained_samples": estimate["retained_samples_used"],
+                "total_retained_samples": int(ranked.shape[1] * ranked.shape[2]),
                 "ess": None,
                 "error": estimate["error"],
             }
             if estimate["available"]:
-                row["ess"] = float(row["retained_samples"] / max(float(estimate["tau"]), 1.0))
+                samples_used = int(estimate["retained_samples_used"])
+                row["ess"] = float(min(samples_used / float(estimate["tau"]), samples_used))
                 parameter_ess.append(float(row["ess"]))
             rows.append(row)
         if len(parameter_ess) == ranked.shape[0]:
@@ -141,7 +153,11 @@ def emcee_rank_bulk_ess(ensemble_chain: np.ndarray) -> dict[str, Any]:
     }
 
 
-def emcee_tail_ess(ensemble_chain: np.ndarray) -> dict[str, Any]:
+def emcee_tail_ess(
+    ensemble_chain: np.ndarray,
+    *,
+    min_usable_walkers: int = 2,
+) -> dict[str, Any]:
     """Estimate lower/upper tail ESS from pooled tail-indicator processes."""
     rows = []
     combined = {}
@@ -157,8 +173,10 @@ def emcee_tail_ess(ensemble_chain: np.ndarray) -> dict[str, Any]:
                 ("lower", values[ensemble_index] <= lower_threshold),
                 ("upper", values[ensemble_index] >= upper_threshold),
             ):
-                estimate = _emcee_tau(indicator.T.astype(float), allow_constant=False)
-                retained_samples = int(values.shape[1] * values.shape[2])
+                estimate = _emcee_tau(
+                    indicator.T.astype(float),
+                    min_usable_walkers=min_usable_walkers,
+                )
                 row = {
                     "ensemble": int(ensemble_index),
                     "parameter": parameter,
@@ -166,12 +184,17 @@ def emcee_tail_ess(ensemble_chain: np.ndarray) -> dict[str, Any]:
                     "threshold": lower_threshold if tail == "lower" else upper_threshold,
                     "tau": estimate["tau"],
                     "available": estimate["available"],
-                    "retained_samples": retained_samples,
+                    "retained_steps": estimate["retained_steps"],
+                    "total_walkers": estimate["total_walkers"],
+                    "usable_walkers": estimate["usable_walkers"],
+                    "retained_samples": estimate["retained_samples_used"],
+                    "total_retained_samples": int(values.shape[1] * values.shape[2]),
                     "ess": None,
                     "error": estimate["error"],
                 }
                 if estimate["available"]:
-                    row["ess"] = float(retained_samples / max(float(estimate["tau"]), 1.0))
+                    samples_used = int(estimate["retained_samples_used"])
+                    row["ess"] = float(min(samples_used / float(estimate["tau"]), samples_used))
                     if tail == "lower":
                         lower_ess.append(float(row["ess"]))
                     else:
@@ -233,7 +256,7 @@ def walker_health_diagnostics(
             extreme_deficit = deficit >= config.severe_walker_logp_deficit_min
             extreme_distance = final_distance >= config.severe_walker_final_distance_min
             severe_rule = bool(
-                (low_acceptance and nearly_unchanged and extreme_deficit)
+                (low_acceptance and nearly_unchanged)
                 or (nearly_unchanged and extreme_deficit and extreme_distance)
             )
             row = {
@@ -261,7 +284,10 @@ def walker_health_diagnostics(
             if severe_rule:
                 severe.append({"ensemble": int(ensemble_index), "walker": int(walker_index), "reason": row["flags"]})
     return {
-        "method": "severe pathology requires combined low acceptance/stasis/log-posterior deficit evidence",
+        "method": (
+            "severe pathology is flagged for frozen low-acceptance walkers, or for "
+            "combined stasis/log-posterior-deficit/final-distance evidence"
+        ),
         "thresholds": {
             "acceptance_fraction_max": config.severe_walker_acceptance_max,
             "repeated_state_fraction_min": config.severe_walker_repeated_fraction_min,
@@ -321,6 +347,7 @@ def convergence_diagnostics(
     ensemble_agreement: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return machine-readable convergence diagnostics for a combined run."""
+    _validate_diagnostic_array_shapes(chain, log_prob, acceptance_fraction, config)
     kept = post_warmup_chain(chain, warmup_steps)
     chain_by_ensemble = _reshape_walkers_by_ensemble(chain, config)
     kept_by_ensemble = _reshape_walkers_by_ensemble(kept, config)
@@ -328,8 +355,14 @@ def convergence_diagnostics(
     acceptance_by_ensemble = _reshape_acceptance_by_ensemble(acceptance_fraction, config)
     too_short = kept.shape[1] < 4 or kept_by_ensemble.shape[0] < 2
     rhat_report = independent_ensemble_state_rhat(kept_by_ensemble)
-    ess_report = emcee_rank_bulk_ess(kept_by_ensemble)
-    tail_ess_report = emcee_tail_ess(kept_by_ensemble)
+    ess_report = emcee_rank_bulk_ess(
+        kept_by_ensemble,
+        min_usable_walkers=config.autocorrelation_min_usable_walkers,
+    )
+    tail_ess_report = emcee_tail_ess(
+        kept_by_ensemble,
+        min_usable_walkers=config.autocorrelation_min_usable_walkers,
+    )
     walker_health = walker_health_diagnostics(
         chain_by_ensemble,
         log_prob_by_ensemble,
@@ -557,16 +590,64 @@ def independent_ensemble_agreement(
 
 def _reshape_walkers_by_ensemble(values: np.ndarray, config: Phase1CConfig) -> np.ndarray:
     array = np.asarray(values)
-    total_walkers = int(array.shape[0])
     n_ensembles = int(config.n_ensembles)
-    if n_ensembles <= 0 or total_walkers % n_ensembles != 0:
-        n_ensembles = total_walkers
-    n_walkers = max(total_walkers // n_ensembles, 1)
+    n_walkers = int(config.n_walkers)
+    expected_walkers = n_ensembles * n_walkers
+    if n_ensembles <= 0 or n_walkers <= 0:
+        raise ValueError("Phase 1C diagnostic configuration must declare positive ensembles and walkers.")
+    if array.ndim not in {1, 2, 3}:
+        raise ValueError(f"Diagnostic array must be 1D, 2D, or 3D; got shape {array.shape}.")
+    if array.shape[0] != expected_walkers:
+        raise ValueError(
+            "Diagnostic array walker axis does not match configuration: "
+            f"got {array.shape[0]}, expected {expected_walkers} "
+            f"({n_ensembles} ensembles x {n_walkers} walkers)."
+        )
+    if array.ndim == 3 and array.shape[2] != len(PARAMETER_ORDER):
+        raise ValueError(
+            "Diagnostic chain parameter dimension does not match PARAMETER_ORDER: "
+            f"got {array.shape[2]}, expected {len(PARAMETER_ORDER)}."
+        )
     return array.reshape((n_ensembles, n_walkers, *array.shape[1:]))
 
 
 def _reshape_acceptance_by_ensemble(values: np.ndarray, config: Phase1CConfig) -> np.ndarray:
     return _reshape_walkers_by_ensemble(np.asarray(values, dtype=float), config)
+
+
+def _validate_diagnostic_array_shapes(
+    chain: np.ndarray,
+    log_prob: np.ndarray,
+    acceptance_fraction: np.ndarray,
+    config: Phase1CConfig,
+) -> None:
+    chain_array = np.asarray(chain)
+    log_prob_array = np.asarray(log_prob)
+    acceptance_array = np.asarray(acceptance_fraction)
+    expected_walkers = int(config.n_ensembles) * int(config.n_walkers)
+    expected_ndim = len(PARAMETER_ORDER)
+    if chain_array.ndim != 3:
+        raise ValueError(f"Diagnostic chain must have shape (walkers, draws, ndim); got {chain_array.shape}.")
+    if chain_array.shape[0] != expected_walkers:
+        raise ValueError(
+            "Diagnostic chain walker count does not match configuration: "
+            f"got {chain_array.shape[0]}, expected {expected_walkers}."
+        )
+    if chain_array.shape[2] != expected_ndim:
+        raise ValueError(
+            "Diagnostic chain parameter dimension does not match PARAMETER_ORDER: "
+            f"got {chain_array.shape[2]}, expected {expected_ndim}."
+        )
+    if log_prob_array.shape != chain_array.shape[:2]:
+        raise ValueError(
+            "Diagnostic log-probability shape must match chain walker/draw axes: "
+            f"got {log_prob_array.shape}, expected {chain_array.shape[:2]}."
+        )
+    if acceptance_array.shape != (expected_walkers,):
+        raise ValueError(
+            "Diagnostic acceptance-fraction shape does not match configuration: "
+            f"got {acceptance_array.shape}, expected {(expected_walkers,)}."
+        )
 
 
 def _post_warmup_ensemble_array(values: np.ndarray, warmup_steps: int) -> np.ndarray:
@@ -602,6 +683,9 @@ def _rank_normalized_split_rhat(values: np.ndarray) -> float | None:
         [ranked[:, : even_draws // 2], ranked[:, even_draws // 2 : even_draws]],
         axis=0,
     )
+    split_variances = np.var(split, axis=1, ddof=1)
+    if not np.all(np.isfinite(split_variances)) or np.any(split_variances <= 0.0):
+        return None
     return _rhat_1d(split)
 
 
@@ -625,27 +709,36 @@ def _rank_normalize_values(values: np.ndarray) -> np.ndarray:
     return ndtri(probabilities).reshape(array.shape)
 
 
-def _emcee_tau(values: np.ndarray, *, allow_constant: bool) -> dict[str, Any]:
+def _emcee_tau(values: np.ndarray, *, min_usable_walkers: int) -> dict[str, Any]:
     array = np.asarray(values, dtype=float)
+    base = {
+        "tau": None,
+        "available": False,
+        "error": None,
+        "retained_steps": int(array.shape[0]) if array.ndim >= 1 else 0,
+        "total_walkers": int(array.shape[1]) if array.ndim == 2 else 0,
+        "usable_walkers": 0,
+        "retained_samples_used": 0,
+    }
     if array.ndim != 2 or array.shape[0] < 3 or not np.all(np.isfinite(array)):
-        return {"tau": None, "available": False, "error": "invalid_or_too_short"}
+        return {**base, "error": "invalid_or_too_short"}
     column_variance = np.var(array, axis=0)
+    usable = np.isfinite(column_variance) & (column_variance > 1.0e-14)
+    usable_count = int(np.sum(usable))
+    base["usable_walkers"] = usable_count
+    base["retained_samples_used"] = int(array.shape[0] * usable_count)
+    if usable_count < int(min_usable_walkers):
+        return {**base, "error": "too_few_varying_walkers"}
+    array = array[:, usable]
     if float(np.var(array)) <= 0.0:
-        if allow_constant:
-            return {"tau": 1.0, "available": True, "error": None}
-        return {"tau": None, "available": False, "error": "zero_variance_indicator"}
-    if not allow_constant:
-        varying = column_variance > 0.0
-        if not np.any(varying):
-            return {"tau": None, "available": False, "error": "zero_variance_indicator"}
-        array = array[:, varying]
+        return {**base, "error": "zero_variance_process"}
     try:
-        tau = float(np.asarray(emcee.autocorr.integrated_time(array, quiet=True, has_walkers=True)).reshape(-1)[0])
+        tau = float(np.asarray(emcee.autocorr.integrated_time(array, quiet=False, has_walkers=True)).reshape(-1)[0])
     except (emcee.autocorr.AutocorrError, ValueError, FloatingPointError, IndexError) as exc:
-        return {"tau": None, "available": False, "error": str(exc)}
+        return {**base, "error": str(exc)}
     if not np.isfinite(tau) or tau <= 0.0:
-        return {"tau": None, "available": False, "error": "nonfinite_or_nonpositive_tau"}
-    return {"tau": tau, "available": True, "error": None}
+        return {**base, "error": "nonfinite_or_nonpositive_tau"}
+    return {**base, "tau": tau, "available": True, "error": None}
 
 
 def _longest_unchanged_run(unchanged: np.ndarray) -> int:
@@ -711,17 +804,19 @@ def _scale_ratio(a_scale: float, b_scale: float) -> float:
     return float(max(a / b, b / a))
 
 
-def _rhat_1d(values: np.ndarray) -> float:
+def _rhat_1d(values: np.ndarray) -> float | None:
     chains, draws = values.shape
     if chains < 2 or draws < 2:
-        return math.inf
+        return None
     chain_means = np.mean(values, axis=1)
     chain_vars = np.var(values, axis=1, ddof=1)
     within = float(np.mean(chain_vars))
-    if within <= 0.0:
-        return 1.0
+    if not np.isfinite(within) or within <= 0.0:
+        return None
     between = draws * float(np.var(chain_means, ddof=1))
     var_hat = ((draws - 1.0) / draws) * within + between / draws
+    if not np.isfinite(var_hat):
+        return None
     return float(math.sqrt(max(var_hat / within, 0.0)))
 
 

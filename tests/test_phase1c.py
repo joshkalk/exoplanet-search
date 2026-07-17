@@ -339,7 +339,7 @@ def test_checkpoint_metadata_validation_and_resume_extension_equivalence(tmp_pat
 
 def test_posterior_summary_and_nonconvergence_status():
     rng = np.random.default_rng(1)
-    config = Phase1CConfig(n_ensembles=1)
+    config = Phase1CConfig(n_ensembles=1, n_walkers=4)
     _, timing, _ = synthetic_dataset(config)
     base = np.array([-2.525, 2.14, 0.32, 0.3, 0.4, -9.43, 0.0, 0.0])
     chain = base + rng.normal(0.0, 0.001, size=(4, 12, len(PARAMETER_ORDER)))
@@ -354,7 +354,7 @@ def test_posterior_summary_and_nonconvergence_status():
         log_prob,
         np.full(4, 0.3),
         None,
-        Phase1CConfig(convergence_ess_minimum=10_000),
+        Phase1CConfig(n_ensembles=1, n_walkers=4, convergence_ess_minimum=10_000),
         warmup_steps=2,
     )
     assert set(PARAMETER_ORDER) <= set(summary["parameter"])
@@ -379,7 +379,7 @@ def test_convergence_requires_complete_parameter_diagnostics(monkeypatch):
         log_prob,
         np.full(16, 0.3),
         _autocorr_report(ensembles=2, tau=0.1, retained_steps=19),
-        Phase1CConfig(convergence_ess_minimum=100.0),
+        Phase1CConfig(n_ensembles=2, n_walkers=8, convergence_ess_minimum=100.0),
         warmup_steps=1,
         posterior_stability={"passed": True},
         ensemble_agreement={"passed": True},
@@ -422,7 +422,12 @@ def test_autocorrelation_rule_requires_every_ensemble_parameter(monkeypatch):
         log_prob,
         np.full(4, 0.3),
         {"rows": rows, "all_available": False, "worst_tau": 1.0, "unavailable_count": 1},
-        Phase1CConfig(convergence_ess_minimum=100.0, convergence_tau_multiple=50.0),
+        Phase1CConfig(
+            n_ensembles=2,
+            n_walkers=2,
+            convergence_ess_minimum=100.0,
+            convergence_tau_multiple=50.0,
+        ),
         warmup_steps=1,
         posterior_stability={"passed": True},
         ensemble_agreement={"passed": True},
@@ -465,7 +470,12 @@ def test_autocorrelation_rule_uses_worst_case_not_median(monkeypatch):
         log_prob,
         np.full(4, 0.3),
         {"rows": rows, "all_available": True, "worst_tau": 3.0, "unavailable_count": 0},
-        Phase1CConfig(convergence_ess_minimum=100.0, convergence_tau_multiple=50.0),
+        Phase1CConfig(
+            n_ensembles=2,
+            n_walkers=2,
+            convergence_ess_minimum=100.0,
+            convergence_tau_multiple=50.0,
+        ),
         warmup_steps=1,
         posterior_stability={"passed": True},
         ensemble_agreement={"passed": True},
@@ -507,7 +517,12 @@ def test_finite_log_probability_fraction_is_convergence_rule(monkeypatch):
         log_prob,
         np.full(4, 0.3),
         {"rows": rows, "all_available": True, "worst_tau": 1.0, "unavailable_count": 0},
-        Phase1CConfig(convergence_ess_minimum=100.0, convergence_tau_multiple=50.0),
+        Phase1CConfig(
+            n_ensembles=2,
+            n_walkers=2,
+            convergence_ess_minimum=100.0,
+            convergence_tau_multiple=50.0,
+        ),
         warmup_steps=1,
         posterior_stability={"passed": True},
         ensemble_agreement={"passed": True},
@@ -520,6 +535,7 @@ def test_convergence_requires_stable_intervals_and_ensemble_agreement(monkeypatc
     config = Phase1CConfig(
         output_dir=tmp_path / "synthetic",
         n_ensembles=2,
+        n_walkers=8,
         convergence_ess_minimum=100.0,
         convergence_stability_chunks=3,
         convergence_ensemble_shift_threshold=0.05,

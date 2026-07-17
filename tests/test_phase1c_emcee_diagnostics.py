@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from exoplanet_search.phase1c_diagnostics import (
+    _validate_diagnostic_array_shapes,
     convergence_diagnostics,
     emcee_rank_bulk_ess,
     emcee_tail_ess,
@@ -9,8 +10,27 @@ from exoplanet_search.phase1c_diagnostics import (
     independent_ensemble_state_rhat,
     walker_health_diagnostics,
 )
-from exoplanet_search.phase1d_draws import _validate_authoritative_diagnostic_criteria
 from exoplanet_search.phase1c_types import DIAGNOSTIC_METHODOLOGY_VERSION, PARAMETER_ORDER, Phase1CConfig
+from exoplanet_search.phase1d_draws import _validate_authoritative_diagnostic_criteria
+
+
+def test_ensemble_state_rhat_fails_closed_for_constant_trajectories():
+    identical = np.zeros((4, 8, 80, len(PARAMETER_ORDER)))
+    shifted = identical.copy()
+    shifted[3, :, :, 0] = 1.0
+    one_constant = _iid_ensemble_chain(seed=11, steps=80, scale=0.02)
+    one_constant[0, :, :, 0] = _base_vector()[0]
+
+    identical_report = independent_ensemble_state_rhat(identical)
+    shifted_report = independent_ensemble_state_rhat(shifted)
+    mixed_report = independent_ensemble_state_rhat(one_constant)
+
+    assert identical_report["complete"] is False
+    assert identical_report["worst_by_parameter"]["log_rp"] is None
+    assert shifted_report["complete"] is False
+    assert shifted_report["worst_by_parameter"]["log_rp"] is None
+    assert mixed_report["complete"] is False
+    assert mixed_report["worst_by_parameter"]["log_rp"] is None
 
 
 def test_ensemble_state_rhat_is_invariant_to_walker_permutation():
@@ -80,9 +100,42 @@ def test_walker_health_flags_stuck_walker_but_not_ordinary_correlated_walkers():
     assert ordinary["severe_walker_count"] == 0
 
 
+def test_walker_health_flags_central_frozen_and_known_prior_informed_pattern():
+    config = Phase1CConfig(n_ensembles=4, n_walkers=32)
+    chain = _iid_ensemble_chain(seed=12, walkers=32, steps=100)
+    log_prob = np.zeros(chain.shape[:3])
+    acceptance = np.full((4, 32), 0.25)
+    chain[0, 0, :, :] = _base_vector()
+    log_prob[0, 0, :] = 10.0
+    acceptance[0, 0] = 0.0
+    known_stuck = (3, 7, 18, 20, 21, 27)
+    for walker in known_stuck:
+        chain[3, walker, :, :] = _base_vector() + 40.0
+        log_prob[3, walker, :] = -1000.0
+        acceptance[3, walker] = 0.0
+
+    health = walker_health_diagnostics(chain, log_prob, acceptance, config, warmup_steps=10)
+    severe = {(row["ensemble"], row["walker"]) for row in health["severe_walkers"]}
+
+    assert (0, 0) in severe
+    assert {(3, walker) for walker in known_stuck}.issubset(severe)
+
+
+def test_walker_health_low_acceptance_moving_walker_is_not_severe():
+    config = Phase1CConfig(n_ensembles=4, n_walkers=8)
+    chain = _iid_ensemble_chain(seed=13, steps=100)
+    log_prob = np.zeros(chain.shape[:3])
+    acceptance = np.full((4, 8), 0.25)
+    acceptance[2, 4] = 0.0
+
+    health = walker_health_diagnostics(chain, log_prob, acceptance, config, warmup_steps=10)
+
+    assert health["severe_walker_count"] == 0
+
+
 def test_emcee_bulk_ess_decreases_for_more_autocorrelated_sequences():
-    iid = _iid_ensemble_chain(seed=8, steps=160, scale=0.02)
-    ar1 = _ar1_ensemble_chain(seed=8, steps=160, rho=0.95)
+    iid = _iid_ensemble_chain(seed=8, steps=1200, scale=0.02)
+    ar1 = _ar1_ensemble_chain(seed=8, steps=1200, rho=0.8)
 
     iid_ess = emcee_rank_bulk_ess(iid)
     ar1_ess = emcee_rank_bulk_ess(ar1)
@@ -92,10 +145,39 @@ def test_emcee_bulk_ess_decreases_for_more_autocorrelated_sequences():
     assert ar1_ess["minimum"] < iid_ess["minimum"]
 
 
+def test_bulk_ess_filters_constant_walker_columns_and_caps_samples_used():
+    constant = np.zeros((4, 8, 600, len(PARAMETER_ORDER)))
+    one_varying = constant.copy()
+    one_varying[:, 0:1, :, :] = _iid_ensemble_chain(seed=14, walkers=1, steps=600, scale=0.02)
+    mixed = _iid_ensemble_chain(seed=15, steps=600, scale=0.02)
+    mixed[:, 4:, :, :] = _base_vector()
+
+    constant_ess = emcee_rank_bulk_ess(constant)
+    one_varying_ess = emcee_rank_bulk_ess(one_varying)
+    mixed_ess = emcee_rank_bulk_ess(mixed)
+
+    assert constant_ess["all_available"] is False
+    assert constant_ess["combined_by_parameter"]["log_rp"] is None
+    assert one_varying_ess["all_available"] is False
+    assert mixed_ess["all_available"] is True
+    assert all(row["usable_walkers"] == 4 for row in mixed_ess["rows"])
+    assert all(row["retained_samples"] == 600 * 4 for row in mixed_ess["rows"])
+    assert all(row["ess"] <= row["retained_samples"] for row in mixed_ess["rows"] if row["ess"] is not None)
+
+
+def test_bulk_ess_requires_emcee_reliable_tau():
+    short = _ar1_ensemble_chain(seed=16, steps=80, rho=0.95)
+
+    report = emcee_rank_bulk_ess(short)
+
+    assert report["all_available"] is False
+    assert report["combined_by_parameter"]["log_rp"] is None
+
+
 def test_tail_ess_detects_persistent_tail_indicators_and_unavailable_tau():
-    iid = _iid_ensemble_chain(seed=9, steps=160, scale=0.02)
+    iid = _iid_ensemble_chain(seed=9, steps=1200, scale=0.02)
     persistent = iid.copy()
-    persistent[:, :, :80, 0] -= 5.0
+    persistent[:, :, :600, 0] -= 5.0
     constant = np.zeros_like(iid)
 
     iid_tail = emcee_tail_ess(iid)
@@ -109,12 +191,43 @@ def test_tail_ess_detects_persistent_tail_indicators_and_unavailable_tau():
     assert unavailable_tail["combined_by_parameter"]["log_rp"] is None
 
 
+def test_tail_ess_fails_when_tail_is_represented_by_one_walker():
+    chain = np.zeros((4, 8, 600, len(PARAMETER_ORDER)))
+    chain[:, 0, :300, 0] = -5.0
+
+    report = emcee_tail_ess(chain)
+
+    assert report["all_available"] is False
+    log_rp_rows = [row for row in report["rows"] if row["parameter"] == "log_rp" and row["tail"] == "lower"]
+    assert all(row["usable_walkers"] == 1 for row in log_rp_rows)
+    assert report["combined_by_parameter"]["log_rp"] is None
+
+
+def test_diagnostic_arrays_must_match_declared_ensemble_layout():
+    config = Phase1CConfig(n_ensembles=4, n_walkers=8)
+    chain = _iid_ensemble_chain(seed=17, steps=40).reshape((32, 40, len(PARAMETER_ORDER)))
+    log_prob = np.zeros(chain.shape[:2])
+    acceptance = np.full(32, 0.25)
+
+    _validate_diagnostic_array_shapes(chain, log_prob, acceptance, config)
+    with pytest.raises(ValueError, match="walker count"):
+        _validate_diagnostic_array_shapes(chain[:31], log_prob[:31], acceptance[:31], config)
+    with pytest.raises(ValueError, match="walker count"):
+        _validate_diagnostic_array_shapes(chain[:24], log_prob[:24], acceptance[:24], config)
+    with pytest.raises(ValueError, match="log-probability shape"):
+        _validate_diagnostic_array_shapes(chain, log_prob[:, :-1], acceptance, config)
+    with pytest.raises(ValueError, match="acceptance-fraction shape"):
+        _validate_diagnostic_array_shapes(chain, log_prob, acceptance[:-1], config)
+    with pytest.raises(ValueError, match="parameter dimension"):
+        _validate_diagnostic_array_shapes(chain[:, :, :-1], log_prob, acceptance, config)
+
+
 def test_convergence_uses_new_policy_and_legacy_values_are_non_gating():
     config = Phase1CConfig(n_ensembles=4, n_walkers=8, convergence_ess_minimum=10.0, convergence_rhat_threshold=1.2)
-    chain = _iid_ensemble_chain(seed=10, steps=120, scale=0.02).reshape((32, 120, len(PARAMETER_ORDER)))
+    chain = _iid_ensemble_chain(seed=10, steps=1200, scale=0.02).reshape((32, 1200, len(PARAMETER_ORDER)))
     log_prob = np.zeros(chain.shape[:2])
     acceptance = np.full(32, 0.3)
-    autocorr = _autocorr_report(config, tau=1.0, retained_steps=119)
+    autocorr = _autocorr_report(config, tau=1.0, retained_steps=1199)
 
     diagnostics = convergence_diagnostics(
         chain,
@@ -130,6 +243,11 @@ def test_convergence_uses_new_policy_and_legacy_values_are_non_gating():
     assert diagnostics["diagnostic_methodology_version"] == DIAGNOSTIC_METHODOLOGY_VERSION
     assert diagnostics["legacy_walker_as_chain_diagnostics"]["gating"] is False
     assert "no_severe_walker_pathology" in diagnostics["criteria"]
+
+
+def test_mismatched_methodology_version_is_rejected_at_config_creation():
+    with pytest.raises(ValueError, match="diagnostic_methodology_version"):
+        Phase1CConfig(diagnostic_methodology_version="old_walker_as_chain")
 
 
 def test_old_diagnostic_policy_version_cannot_be_used_authoritatively():

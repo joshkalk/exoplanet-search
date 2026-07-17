@@ -268,6 +268,9 @@ def _stored_phase1c_config(config: Phase1CConfig) -> Phase1CConfig:
         payload[key] = Path(payload[key])
     for key in tuple_fields & set(payload):
         payload[key] = tuple(payload[key])
+    if "prior_informed_cloud_logp_drop" in payload:
+        payload.setdefault("prior_informed_max_logp_deficit", payload["prior_informed_cloud_logp_drop"])
+        payload.pop("prior_informed_cloud_logp_drop", None)
     stored = Phase1CConfig(**payload)
     return replace(stored, output_dir=config.output_dir, run_id=config.run_id)
 

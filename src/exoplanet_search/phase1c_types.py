@@ -61,13 +61,15 @@ class Phase1CConfig:
     convergence_interval_overlap_minimum: float = 0.25
     convergence_tail_interval_overlap_minimum: float = 0.25
     convergence_ensemble_scale_ratio_max: float = 3.0
+    autocorrelation_min_usable_walkers: int = 2
     max_pilot_seconds: float = 600.0
     minimum_meaningful_summary_draws: int = 1000
     diagnostic_methodology_version: str = DIAGNOSTIC_METHODOLOGY_VERSION
-    prior_informed_pool_size: int = 512
+    prior_informed_pool_size: int = 1024
+    prior_informed_pool_scale_multiplier: float = 0.8
     prior_informed_elite_size: int = 16
-    prior_informed_min_finite_candidates: int = 16
-    prior_informed_cloud_logp_drop: float = 30.0
+    prior_informed_min_finite_candidates: int = 8
+    prior_informed_max_logp_deficit: float = 30.0
     local_tight_scales: tuple[float, ...] = (0.015, 0.02, 0.015, 0.015, 0.015, 0.05, 1.0e-5, 2.0e-4)
     local_moderate_scales: tuple[float, ...] = (0.04, 0.05, 0.04, 0.04, 0.04, 0.12, 5.0e-5, 1.0e-3)
     local_broad_scales: tuple[float, ...] = (0.08, 0.10, 0.08, 0.08, 0.08, 0.25, 2.0e-4, 5.0e-3)
@@ -85,6 +87,19 @@ class Phase1CConfig:
     severe_walker_repeated_fraction_min: float = 0.95
     severe_walker_logp_deficit_min: float = 100.0
     severe_walker_final_distance_min: float = 25.0
+
+    def __post_init__(self) -> None:
+        if self.diagnostic_methodology_version != DIAGNOSTIC_METHODOLOGY_VERSION:
+            raise ValueError(
+                "diagnostic_methodology_version must equal "
+                f"{DIAGNOSTIC_METHODOLOGY_VERSION!r}."
+            )
+        if int(self.autocorrelation_min_usable_walkers) < 2:
+            raise ValueError("autocorrelation_min_usable_walkers must be at least 2.")
+        if float(self.prior_informed_pool_scale_multiplier) <= 0.0:
+            raise ValueError("prior_informed_pool_scale_multiplier must be positive.")
+        if float(self.prior_informed_max_logp_deficit) < 0.0:
+            raise ValueError("prior_informed_max_logp_deficit must be nonnegative.")
 
     def to_dict(self) -> dict[str, Any]:
         values = asdict(self)
