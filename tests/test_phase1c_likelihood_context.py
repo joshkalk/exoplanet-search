@@ -1,4 +1,5 @@
 import math
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -81,9 +82,9 @@ def test_context_event_conditionals_match_reference_event_math(tmp_path):
             baseline_slope_sigma=config.baseline_slope_sigma,
         )
         optimized = marginalized_event_log_likelihood_from_context(event, context_model, sample.jitter, context)
-        assert optimized.log_likelihood == pytest.approx(reference.log_likelihood, abs=1.0e-12)
-        assert optimized.baseline_mean == pytest.approx(reference.baseline_mean, abs=1.0e-12)
-        assert optimized.baseline_covariance == pytest.approx(reference.baseline_covariance, abs=1.0e-12)
+        assert optimized.log_likelihood == pytest.approx(reference.log_likelihood, rel=0.0, abs=1.0e-12)
+        assert optimized.baseline_mean == pytest.approx(reference.baseline_mean, rel=0.0, abs=1.0e-12)
+        assert optimized.baseline_covariance == pytest.approx(reference.baseline_covariance, rel=0.0, abs=1.0e-12)
 
 
 def test_profiled_context_path_matches_reference_and_records_categories(tmp_path):
@@ -97,7 +98,7 @@ def test_profiled_context_path_matches_reference_and_records_categories(tmp_path
     reference = reference_profiled_log_probability(vector, data, config, timing, reference_profiler)
     optimized = profiled_log_probability_with_context(vector, context, optimized_profiler)
 
-    assert optimized == pytest.approx(reference, abs=1.0e-12)
+    assert optimized == pytest.approx(reference, rel=0.0, abs=1.0e-12)
     for summary in (reference_profiler.summary(), optimized_profiler.summary()):
         assert summary["posterior_calls"] == 1
         assert set(summary) == {
@@ -201,6 +202,53 @@ def test_context_likelihood_matches_reference_for_real_phase1b_data():
         _assert_reference_equivalence(vector, data, config, timing, context, abs_tol=1.0e-9)
 
 
+def test_context_supports_noncontiguous_events(tmp_path):
+    config = Phase1CConfig(output_dir=tmp_path / "noncontiguous", n_ensembles=1, n_walkers=16)
+    data, timing, _ = synthetic_dataset(config)
+    event_ids = np.unique(data.event_number)
+    event_positions = [np.flatnonzero(data.event_number == event) for event in event_ids]
+    order = np.asarray([positions[row] for row in range(event_positions[0].size) for positions in event_positions])
+    interleaved = _reordered_data(data, order)
+    context = Phase1CLikelihoodContext.from_data(interleaved, config, timing)
+    vector = deterministic_center_vector(interleaved, config, timing)
+
+    noncontiguous_events = [event for event in context.events if not event.is_contiguous]
+    assert len(noncontiguous_events) == context.event_count
+    assert all(event.data_slice is None for event in noncontiguous_events)
+    _assert_event_partition_covers_every_cadence_once(context)
+    _assert_reference_equivalence(vector, interleaved, config, timing, context)
+    _assert_event_likelihood_equivalence(interleaved, config, timing, context, vector)
+
+
+def test_context_supports_safe_multiple_exposure_groups(tmp_path):
+    config = Phase1CConfig(output_dir=tmp_path / "safe_exposures", n_ensembles=1, n_walkers=16)
+    data, timing, _ = synthetic_dataset(config)
+    exposure_days = np.where(np.arange(data.cadence_count) % 2 == 0, 0.02, 0.03)
+    varied_exposure = replace(data, exposure_days=exposure_days)
+    context = Phase1CLikelihoodContext.from_data(varied_exposure, config, timing)
+    vector = deterministic_center_vector(varied_exposure, config, timing)
+
+    assert context.exposure_groups_safe is True
+    assert len(context.exposure_groups) == 2
+    assert _exposure_group_coverage_counts(context).tolist() == [1] * context.cadence_count
+    _assert_reference_equivalence(vector, varied_exposure, config, timing, context)
+
+
+def test_context_falls_back_for_unsafe_overlapping_exposure_groups(tmp_path):
+    config = Phase1CConfig(output_dir=tmp_path / "unsafe_exposures", n_ensembles=1, n_walkers=16)
+    data, timing, _ = synthetic_dataset(config)
+    exposure_days = np.where(np.arange(data.cadence_count) % 2 == 0, 0.02, 0.0200000000005)
+    overlapping_exposure = replace(data, exposure_days=exposure_days)
+    context = Phase1CLikelihoodContext.from_data(overlapping_exposure, config, timing)
+    vector = deterministic_center_vector(overlapping_exposure, config, timing)
+
+    assert context.exposure_groups_safe is False
+    assert len(context.exposure_groups) == 2
+    assert max(_exposure_group_coverage_counts(context)) > 1
+    _assert_event_partition_covers_every_cadence_once(context)
+    _assert_reference_equivalence(vector, overlapping_exposure, config, timing, context)
+
+
 def _synthetic_valid_vectors(data, config, timing, context):
     init = build_initialization(
         data,
@@ -218,24 +266,83 @@ def _synthetic_valid_vectors(data, config, timing, context):
 def _assert_reference_equivalence(vector, data, config, timing, context, *, abs_tol=1.0e-12):
     reference_model = transit_model_for_vector(vector, data, config, timing)
     optimized_model = transit_model_for_sample(vector_to_physical(vector, timing), context)
-    assert optimized_model == pytest.approx(reference_model, abs=abs_tol)
+    assert optimized_model == pytest.approx(reference_model, rel=0.0, abs=abs_tol)
     assert log_likelihood_with_context(vector, context) == pytest.approx(
         reference_log_likelihood(vector, data, config, timing),
+        rel=0.0,
         abs=abs_tol,
     )
     assert log_probability_with_context(vector, context) == pytest.approx(
         reference_log_probability(vector, data, config, timing),
+        rel=0.0,
         abs=abs_tol,
     )
+
+
+def _assert_event_likelihood_equivalence(data, config, timing, context, vector, *, abs_tol=1.0e-12):
+    sample = vector_to_physical(vector, timing)
+    reference_model = transit_model_for_vector(vector, data, config, timing)
+    context_model = transit_model_for_sample(sample, context)
+    for event in context.events:
+        mask = data.event_number == event.event_number
+        reference = marginalized_event_log_likelihood(
+            time=data.time[mask],
+            flux=data.flux[mask],
+            flux_uncertainty=data.flux_uncertainty[mask],
+            transit_model=reference_model[mask],
+            frozen_center=float(np.median(data.predicted_center[mask])),
+            jitter=sample.jitter,
+            baseline_intercept_sigma=config.baseline_intercept_sigma,
+            baseline_slope_sigma=config.baseline_slope_sigma,
+        )
+        optimized = marginalized_event_log_likelihood_from_context(event, context_model, sample.jitter, context)
+        assert optimized.log_likelihood == pytest.approx(reference.log_likelihood, rel=0.0, abs=abs_tol)
+        assert optimized.baseline_mean == pytest.approx(reference.baseline_mean, rel=0.0, abs=abs_tol)
+        assert optimized.baseline_covariance == pytest.approx(reference.baseline_covariance, rel=0.0, abs=abs_tol)
+
+
+def _assert_event_partition_covers_every_cadence_once(context):
+    coverage = np.zeros(context.cadence_count, dtype=int)
+    for event in context.events:
+        coverage[event.data_indices] += 1
+    assert coverage.tolist() == [1] * context.cadence_count
 
 
 def _assert_context_arrays_are_read_only(context):
     assert context.time.flags.writeable is False
     assert context.exposure_days.flags.writeable is False
     assert context.event_number.flags.writeable is False
+    assert context.event_numbers.flags.writeable is False
     assert context.baseline_mean.flags.writeable is False
+    assert context.baseline_variance.flags.writeable is False
+    assert context.baseline_precision.flags.writeable is False
     for event in context.events:
+        assert event.data_indices.flags.writeable is False
         assert event.time.flags.writeable is False
         assert event.flux.flags.writeable is False
         assert event.flux_uncertainty_squared.flags.writeable is False
         assert event.local_coordinate.flags.writeable is False
+    for group in context.exposure_groups:
+        assert group.time.flags.writeable is False
+        assert group.data_indices.flags.writeable is False
+
+
+def _exposure_group_coverage_counts(context):
+    coverage = np.zeros(context.cadence_count, dtype=int)
+    for group in context.exposure_groups:
+        coverage[group.data_indices] += 1
+    return coverage
+
+
+def _reordered_data(data, order):
+    return replace(
+        data,
+        time=data.time[order],
+        flux=data.flux[order],
+        flux_uncertainty=data.flux_uncertainty[order],
+        event_number=data.event_number[order],
+        predicted_center=data.predicted_center[order],
+        product_id=data.product_id[order],
+        quarter=data.quarter[order],
+        exposure_days=data.exposure_days[order],
+    )
