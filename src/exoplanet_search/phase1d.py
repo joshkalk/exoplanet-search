@@ -11,12 +11,9 @@ from typing import Any
 
 import numpy as np
 
-from .phase1c import synthetic_dataset
-from .phase1c_inputs import load_frozen_phase1b
-from .phase1c_parameters import build_timing_reference
 from .phase1d_draws import (
     Phase1DSourcePolicy,
-    load_phase1c_config,
+    load_phase1d_source,
     select_posterior_draws,
     write_draw_selection,
 )
@@ -49,27 +46,25 @@ def run_phase1d_development_predictive(config: Phase1DDevelopmentConfig) -> dict
         raise FileExistsError(f"Refusing to overwrite existing Phase 1D development output: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    phase1c_config = load_phase1c_config(config.source_run_dir)
-    data, timing = _data_for_source(phase1c_config)
-    policy = Phase1DSourcePolicy(
-        require_converged=False,
-        allow_nonproduction=config.allow_nonproduction_source,
-        authoritative=False,
-        override_reason="development-only predictive plumbing validation",
-    )
-    selection = select_posterior_draws(
-        config.source_run_dir,
-        timing=timing,
-        requested_draws=config.n_draws,
-        seed=config.selection_seed,
-        policy=policy,
-    )
+    if config.allow_nonproduction_source:
+        policy = Phase1DSourcePolicy.development_override("development-only predictive plumbing validation")
+    else:
+        policy = Phase1DSourcePolicy(require_converged=True, allow_nonproduction=False, authoritative=False)
+    source = load_phase1d_source(config.source_run_dir, policy)
+    selection = select_posterior_draws(source, requested_draws=config.n_draws, seed=config.selection_seed)
     write_draw_selection(output_dir, selection)
     rng = np.random.default_rng(config.predictive_seed)
     predictive_rows = []
     baseline_rows = []
     for draw in selection.selected_draws:
-        rows, baseline = generate_replicated_flux(draw, data, phase1c_config, timing, rng)
+        rows, baseline = generate_replicated_flux(
+            draw,
+            source.data,
+            source.config,
+            source.timing,
+            rng,
+            replication_index=len(predictive_rows),
+        )
         predictive_rows.append(rows)
         baseline_rows.extend(baseline)
     config_payload = {
@@ -84,8 +79,8 @@ def run_phase1d_development_predictive(config: Phase1DDevelopmentConfig) -> dict
         "n_draws": config.n_draws,
         "selection_seed": config.selection_seed,
         "predictive_seed": config.predictive_seed,
-        "cadence_count": data.cadence_count,
-        "event_count": data.event_count,
+        "cadence_count": source.data.cadence_count,
+        "event_count": source.data.event_count,
         "residual_resampling_used": False,
         "predictive_equation": "replicated_flux = [m, m*x] beta_draw + Normal(0, sigma_i^2 + jitter^2)",
         "baseline_distribution": "beta | y, theta ~ Normal(baseline_mean, baseline_covariance)",
@@ -102,7 +97,7 @@ def run_phase1d_development_predictive(config: Phase1DDevelopmentConfig) -> dict
         "run_id": run_id,
         "output_dir": str(output_dir),
         "selected_draws": len(selection.selected_draws),
-        "cadence_count": data.cadence_count,
+        "cadence_count": source.data.cadence_count,
         "baseline_draw_count": len(baseline_rows),
         "files": {
             "configuration": str(output_dir / "phase1d_predictive_configuration.json"),
@@ -115,22 +110,6 @@ def run_phase1d_development_predictive(config: Phase1DDevelopmentConfig) -> dict
     with (output_dir / "development_predictive_summary.json").open("w", encoding="utf-8") as output_file:
         json.dump(result, output_file, indent=2)
     return result
-
-
-def _data_for_source(phase1c_config):
-    mode = _read_source_mode(phase1c_config.output_dir)
-    if mode in {"synthetic", "synthetic_recovery"}:
-        data, timing, _ = synthetic_dataset(phase1c_config)
-        return data, timing
-    data = load_frozen_phase1b(phase1c_config)
-    return data, build_timing_reference(data, phase1c_config)
-
-
-def _read_source_mode(run_dir: Path) -> str:
-    path = run_dir / "sampler_diagnostics.json"
-    with path.open("r", encoding="utf-8") as input_file:
-        payload = json.load(input_file)
-    return str(payload.get("mode", ""))
 
 
 def _run_id(config: Phase1DDevelopmentConfig) -> str:

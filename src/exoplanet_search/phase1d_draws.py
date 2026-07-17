@@ -9,9 +9,14 @@ from typing import Any
 
 import h5py
 import numpy as np
+import pandas as pd
 
+from .phase1c import _validate_synthetic_input_record_if_needed, checkpoint_metadata, synthetic_dataset
+from .phase1c_inputs import load_frozen_phase1b
 from .phase1c_parameters import vector_to_physical
-from .phase1c_types import PARAMETER_ORDER, Phase1CConfig, PhysicalSample, TimingReference
+from .phase1c_sampler import validate_checkpoint_metadata
+from .phase1c_parameters import build_timing_reference
+from .phase1c_types import PARAMETER_ORDER, FrozenPhase1BData, Phase1CConfig, PhysicalSample, TimingReference
 
 
 @dataclass(frozen=True)
@@ -22,6 +27,32 @@ class Phase1DSourcePolicy:
     allow_nonproduction: bool = False
     authoritative: bool = True
     override_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        reason = self.override_reason.strip() if isinstance(self.override_reason, str) else self.override_reason
+        object.__setattr__(self, "override_reason", reason)
+        if self.authoritative:
+            if not self.require_converged:
+                raise ValueError("Authoritative Phase 1D access requires require_converged=True.")
+            if self.allow_nonproduction:
+                raise ValueError("Authoritative Phase 1D access cannot allow nonproduction sources.")
+            if self.override_reason is not None:
+                raise ValueError("Authoritative Phase 1D access cannot include an override reason.")
+        if not self.require_converged or self.allow_nonproduction:
+            if self.authoritative:
+                raise ValueError("Nonconverged or nonproduction overrides must be nonauthoritative.")
+            if not self.override_reason:
+                raise ValueError("Nonconverged or nonproduction overrides require a nonempty reason.")
+        if self.override_reason == "":
+            raise ValueError("Override reason must be nonempty when provided.")
+
+    @classmethod
+    def authoritative_production(cls) -> "Phase1DSourcePolicy":
+        return cls(require_converged=True, allow_nonproduction=False, authoritative=True, override_reason=None)
+
+    @classmethod
+    def development_override(cls, reason: str) -> "Phase1DSourcePolicy":
+        return cls(require_converged=False, allow_nonproduction=True, authoritative=False, override_reason=reason)
 
 
 @dataclass(frozen=True)
@@ -45,6 +76,26 @@ class EnsembleSource:
     @property
     def eligible_count(self) -> int:
         return self.retained_steps * self.walkers
+
+
+@dataclass(frozen=True)
+class ValidatedPhase1DSource:
+    """Phase 1D source with bound configuration, data, timing, HDFs, and diagnostics."""
+
+    run_dir: Path
+    config: Phase1CConfig
+    mode: str
+    data: FrozenPhase1BData
+    timing: TimingReference
+    ensembles: tuple[EnsembleSource, ...]
+    diagnostics: dict[str, Any]
+    checkpoint_iterations: dict[str, int]
+    input_provenance: dict[str, Any]
+    policy: Phase1DSourcePolicy
+
+    @property
+    def run_id(self) -> str:
+        return str(self.config.run_id)
 
 
 @dataclass(frozen=True)
@@ -118,52 +169,74 @@ def load_phase1c_config(run_dir: Path) -> Phase1CConfig:
     return type(config)(**{**config.__dict__, "output_dir": run_dir})
 
 
-def load_phase1c_draw_sources(run_dir: Path, policy: Phase1DSourcePolicy) -> tuple[Phase1CConfig, tuple[EnsembleSource, ...]]:
-    """Validate Phase 1C HDF files and return ensemble sources.
+def load_phase1d_source(run_dir: Path, policy: Phase1DSourcePolicy) -> ValidatedPhase1DSource:
+    """Validate and bind a Phase 1C source for Phase 1D draw access.
 
     Scientific Phase 1D posterior predictive execution requires a converged
-    production source. Development-only overrides must be explicit and are
-    recorded in selection manifests.
+    production source with current diagnostics. Development-only overrides are
+    nonauthoritative and recorded in selection manifests.
     """
     config = load_phase1c_config(run_dir)
     diagnostics = _read_json(run_dir / "sampler_diagnostics.json")
-    status = str(diagnostics.get("status", ""))
-    if policy.require_converged and status != "converged":
-        raise ValueError(f"Authoritative Phase 1D draw access requires converged diagnostics, found {status!r}.")
+    mode = str(diagnostics.get("mode", ""))
+    _validate_diagnostics_identity(diagnostics, config)
+    data, timing, input_provenance = _load_bound_data_and_timing(config, mode)
 
+    metadata = checkpoint_metadata(data, config, mode=mode)
     sources = []
     seen_run_ids = set()
     seen_modes = set()
-    for path in sorted(run_dir.glob("ensemble_*.h5")):
-        source = _validate_hdf_source(path, config)
+    for ensemble_index in range(config.n_ensembles):
+        path = run_dir / f"ensemble_{ensemble_index:02d}.h5"
+        validate_checkpoint_metadata(path, metadata, config.random_seed + 1000 * ensemble_index)
+        source = _validate_hdf_source(path, config, expected_mode=mode)
         sources.append(source)
         seen_run_ids.add(source.run_id)
         seen_modes.add(source.mode)
-    if not sources:
-        raise FileNotFoundError(f"No Phase 1C ensemble HDF files found in {run_dir}.")
-    if len(sources) != config.n_ensembles:
-        raise ValueError(f"Expected {config.n_ensembles} ensemble files, found {len(sources)}.")
+
     expected = set(range(config.n_ensembles))
     actual = {source.ensemble for source in sources}
     if actual != expected:
         raise ValueError(f"Phase 1C ensemble set mismatch: expected {sorted(expected)}, found {sorted(actual)}.")
-    if len(seen_run_ids) != 1 or config.run_id not in seen_run_ids:
+    if seen_run_ids != {str(config.run_id)}:
         raise ValueError("Phase 1C HDF files contain mixed or unexpected run IDs.")
-    if len(seen_modes) != 1:
-        raise ValueError("Phase 1C HDF files contain mixed modes.")
-    mode = next(iter(seen_modes))
+    if seen_modes != {mode}:
+        raise ValueError("Phase 1C HDF files contain mixed or unexpected modes.")
+
     if mode != "production" and not policy.allow_nonproduction:
         raise ValueError(f"Authoritative Phase 1D draw access requires production mode, found {mode!r}.")
-    return config, tuple(sorted(sources, key=lambda source: source.ensemble))
+    status = str(diagnostics.get("status", ""))
+    if policy.require_converged and status != "converged":
+        raise ValueError(f"Authoritative Phase 1D draw access requires converged diagnostics, found {status!r}.")
+    checkpoint_iterations = {source.path.name: source.steps for source in sources}
+    if policy.authoritative:
+        _validate_authoritative_diagnostics(run_dir, config, mode, diagnostics, sources)
+
+    return ValidatedPhase1DSource(
+        run_dir=run_dir,
+        config=config,
+        mode=mode,
+        data=data,
+        timing=timing,
+        ensembles=tuple(sorted(sources, key=lambda source: source.ensemble)),
+        diagnostics=diagnostics,
+        checkpoint_iterations=checkpoint_iterations,
+        input_provenance=input_provenance,
+        policy=policy,
+    )
+
+
+def load_phase1c_draw_sources(run_dir: Path, policy: Phase1DSourcePolicy) -> tuple[Phase1CConfig, tuple[EnsembleSource, ...]]:
+    """Validate Phase 1C HDF files and return ensemble sources."""
+    source = load_phase1d_source(run_dir, policy)
+    return source.config, source.ensembles
 
 
 def select_posterior_draws(
-    run_dir: Path,
+    source: ValidatedPhase1DSource,
     *,
-    timing: TimingReference,
     requested_draws: int,
     seed: int,
-    policy: Phase1DSourcePolicy,
 ) -> DrawSelection:
     """Select deterministic ensemble-aware posterior draws without replacement.
 
@@ -174,42 +247,45 @@ def select_posterior_draws(
     """
     if requested_draws <= 0:
         raise ValueError("requested_draws must be positive.")
-    config, sources = load_phase1c_draw_sources(run_dir, policy)
+    config = source.config
+    sources = source.ensembles
     allocation = _draw_allocation(sources, requested_draws)
     rng = np.random.default_rng(seed)
     selected: list[SelectedPosteriorDraw] = []
     selected_by_ensemble = {}
     selected_by_walker: dict[str, int] = {}
-    for source in sources:
-        count = allocation[source.ensemble]
-        if source.eligible_count < count:
+    for ensemble_source in sources:
+        count = allocation[ensemble_source.ensemble]
+        if ensemble_source.eligible_count < count:
             raise ValueError(
-                f"Ensemble {source.ensemble} has {source.eligible_count} eligible draws, "
+                f"Ensemble {ensemble_source.ensemble} has {ensemble_source.eligible_count} eligible draws, "
                 f"cannot select {count} without replacement."
             )
-        flat_choices = rng.choice(source.eligible_count, size=count, replace=False)
-        selected_by_ensemble[str(source.ensemble)] = int(count)
-        with h5py.File(source.path, "r") as hdf:
+        flat_choices = rng.choice(ensemble_source.eligible_count, size=count, replace=False)
+        selected_by_ensemble[str(ensemble_source.ensemble)] = int(count)
+        with h5py.File(ensemble_source.path, "r") as hdf:
             chain = hdf["mcmc/chain"]
             log_prob = hdf["mcmc/log_prob"]
             for local_position in np.sort(flat_choices):
-                retained_step = int(local_position // source.walkers)
-                walker = int(local_position % source.walkers)
-                step = int(source.warmup_steps + retained_step)
+                retained_step = int(local_position // ensemble_source.walkers)
+                walker = int(local_position % ensemble_source.walkers)
+                step = int(ensemble_source.warmup_steps + retained_step)
                 vector = np.asarray(chain[step, walker, :], dtype=float)
                 value = float(log_prob[step, walker])
                 if not np.all(np.isfinite(vector)) or not np.isfinite(value):
-                    raise ValueError(f"Selected nonfinite draw from {source.path}: step={step}, walker={walker}.")
-                physical = vector_to_physical(vector, timing)
-                selected_by_walker[f"{source.ensemble}:{walker}"] = selected_by_walker.get(
-                    f"{source.ensemble}:{walker}", 0
+                    raise ValueError(
+                        f"Selected nonfinite draw from {ensemble_source.path}: step={step}, walker={walker}."
+                    )
+                physical = vector_to_physical(vector, source.timing)
+                selected_by_walker[f"{ensemble_source.ensemble}:{walker}"] = selected_by_walker.get(
+                    f"{ensemble_source.ensemble}:{walker}", 0
                 ) + 1
                 selected.append(
                     SelectedPosteriorDraw(
-                        run_id=source.run_id,
-                        mode=source.mode,
-                        ensemble=source.ensemble,
-                        ensemble_seed=source.seed,
+                        run_id=ensemble_source.run_id,
+                        mode=ensemble_source.mode,
+                        ensemble=ensemble_source.ensemble,
+                        ensemble_seed=ensemble_source.seed,
                         walker=walker,
                         step=step,
                         log_posterior=value,
@@ -223,22 +299,23 @@ def select_posterior_draws(
         raise ValueError("Draw selection produced duplicate HDF positions.")
     manifest = {
         "schema_version": "phase1d_draw_selection_v1",
-        "source_run_dir": str(run_dir),
+        "source_run_dir": str(source.run_dir),
         "source_run_id": config.run_id,
         "source_mode": selected[0].mode if selected else None,
-        "authoritative": policy.authoritative,
-        "nonproduction_override": policy.allow_nonproduction,
-        "override_reason": policy.override_reason,
+        "authoritative": source.policy.authoritative,
+        "nonproduction_override": source.policy.allow_nonproduction or not source.policy.require_converged,
+        "override_reason": source.policy.override_reason,
         "selection_seed": seed,
         "requested_draws": requested_draws,
         "selected_draws": len(selected),
         "eligible_counts_by_ensemble": {str(source.ensemble): source.eligible_count for source in sources},
         "selected_counts_by_ensemble": selected_by_ensemble,
         "selected_counts_by_walker": selected_by_walker,
+        "checkpoint_iterations": source.checkpoint_iterations,
         "parameter_order": list(PARAMETER_ORDER),
     }
     return DrawSelection(
-        source_run_dir=run_dir,
+        source_run_dir=source.run_dir,
         run_id=str(config.run_id),
         mode=str(selected[0].mode if selected else ""),
         selection_seed=seed,
@@ -257,7 +334,7 @@ def write_draw_selection(output_dir: Path, selection: DrawSelection) -> None:
             output_file.write(json.dumps(draw.audit_record(), sort_keys=True, separators=(",", ":")) + "\n")
 
 
-def _validate_hdf_source(path: Path, config: Phase1CConfig) -> EnsembleSource:
+def _validate_hdf_source(path: Path, config: Phase1CConfig, *, expected_mode: str) -> EnsembleSource:
     with h5py.File(path, "r") as hdf:
         for name in ("mcmc/chain", "mcmc/log_prob", "mcmc/accepted"):
             if name not in hdf:
@@ -269,6 +346,12 @@ def _validate_hdf_source(path: Path, config: Phase1CConfig) -> EnsembleSource:
         steps, walkers, ndim = map(int, chain.shape)
         if log_prob.shape != (steps, walkers):
             raise ValueError(f"mcmc/log_prob shape does not match chain shape: {path}")
+        accepted = hdf["mcmc/accepted"]
+        if accepted.shape != (walkers,):
+            raise ValueError(f"mcmc/accepted shape does not match walker count: {path}")
+        accepted_values = np.asarray(accepted[:], dtype=float)
+        if not np.all(np.isfinite(accepted_values)) or np.any(accepted_values < 0.0):
+            raise ValueError(f"mcmc/accepted contains nonfinite or negative values: {path}")
         if ndim != len(PARAMETER_ORDER):
             raise ValueError(f"Expected {len(PARAMETER_ORDER)} parameters, found {ndim}: {path}")
         if walkers != config.n_walkers:
@@ -280,6 +363,8 @@ def _validate_hdf_source(path: Path, config: Phase1CConfig) -> EnsembleSource:
         if run_id != str(config.run_id):
             raise ValueError(f"Run ID mismatch for {path}: {run_id!r}")
         mode = str(_json_attr(hdf.attrs, "phase1c_mode"))
+        if mode != expected_mode:
+            raise ValueError(f"Mode mismatch for {path}: {mode!r}")
         seed = int(hdf.attrs.get("phase1c_ensemble_seed", -1))
         if seed < 0 or (seed - config.random_seed) % 1000 != 0:
             raise ValueError(f"Cannot infer ensemble from seed {seed}: {path}")
@@ -300,6 +385,62 @@ def _validate_hdf_source(path: Path, config: Phase1CConfig) -> EnsembleSource:
         ndim=ndim,
         warmup_steps=config.warmup_steps,
     )
+
+
+def _validate_diagnostics_identity(diagnostics: dict[str, Any], config: Phase1CConfig) -> None:
+    if str(diagnostics.get("run_id", "")) != str(config.run_id):
+        raise ValueError("sampler_diagnostics.json run ID does not match Phase 1C configuration.")
+    if str(diagnostics.get("mode", "")) not in {"pilot", "production", "synthetic", "synthetic_recovery"}:
+        raise ValueError("sampler_diagnostics.json has missing or invalid mode.")
+
+
+def _load_bound_data_and_timing(
+    config: Phase1CConfig,
+    mode: str,
+) -> tuple[FrozenPhase1BData, TimingReference, dict[str, Any]]:
+    if mode in {"synthetic", "synthetic_recovery"}:
+        data, timing, _ = synthetic_dataset(config)
+        _validate_synthetic_input_record_if_needed(data, timing, config, mode)
+        return data, timing, {"synthetic_input_record": str(config.output_dir / "synthetic_input_record.json")}
+    data = load_frozen_phase1b(config)
+    timing = build_timing_reference(data, config)
+    return data, timing, {"phase1b_input_manifest": data.input_manifest}
+
+
+def _validate_authoritative_diagnostics(
+    run_dir: Path,
+    config: Phase1CConfig,
+    mode: str,
+    diagnostics: dict[str, Any],
+    sources: list[EnsembleSource],
+) -> None:
+    if mode != "production":
+        raise ValueError(f"Authoritative Phase 1D source mode must be production, found {mode!r}.")
+    if str(diagnostics.get("status", "")) != "converged":
+        raise ValueError("Authoritative Phase 1D source requires converged sampler_diagnostics.json.")
+    iterations = {source.steps for source in sources}
+    if len(iterations) != 1:
+        raise ValueError("Authoritative Phase 1D source has unequal ensemble iteration counts.")
+    current_steps = next(iter(iterations))
+    row = _final_convergence_history_row(run_dir)
+    if str(row.get("run_id", "")) != str(config.run_id):
+        raise ValueError("convergence_history.csv run ID does not match Phase 1C configuration.")
+    if str(row.get("mode", "")) != mode:
+        raise ValueError("convergence_history.csv mode does not match Phase 1C source mode.")
+    if int(row.get("completed_steps", -1)) != int(current_steps):
+        raise ValueError("convergence_history.csv is stale relative to current HDF checkpoints.")
+    if str(row.get("convergence_status", "")) != "converged":
+        raise ValueError("Final convergence_history.csv row is not converged.")
+
+
+def _final_convergence_history_row(run_dir: Path) -> dict[str, Any]:
+    path = run_dir / "convergence_history.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"Missing convergence history: {path}")
+    frame = pd.read_csv(path)
+    if frame.empty:
+        raise ValueError(f"Empty convergence history: {path}")
+    return frame.iloc[-1].to_dict()
 
 
 def _parameter_order_from_attrs(hdf: h5py.File) -> list[str]:

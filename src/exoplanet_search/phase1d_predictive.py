@@ -27,10 +27,14 @@ class EventBaselineDraw:
     transit_model: np.ndarray
     local_coordinate: np.ndarray
     covariance_eigenvalues: np.ndarray
+    cholesky_diagonal: np.ndarray
 
-    def audit_record(self, draw: SelectedPosteriorDraw) -> dict[str, Any]:
+    def audit_record(self, draw: SelectedPosteriorDraw, *, replication_index: int) -> dict[str, Any]:
         return {
             "source_run_id": draw.run_id,
+            "source_mode": draw.mode,
+            "selection_position": draw.selection_position,
+            "predictive_replication_index": replication_index,
             "ensemble": draw.ensemble,
             "walker": draw.walker,
             "step": draw.step,
@@ -40,6 +44,7 @@ class EventBaselineDraw:
             "conditional_mean": [float(value) for value in self.conditional_mean],
             "conditional_covariance": self.conditional_covariance.astype(float).tolist(),
             "covariance_eigenvalues": [float(value) for value in self.covariance_eigenvalues],
+            "cholesky_diagonal": [float(value) for value in self.cholesky_diagonal],
         }
 
 
@@ -50,6 +55,9 @@ def draw_conditional_event_baseline(
     config: Phase1CConfig,
     timing: TimingReference,
     rng: np.random.Generator,
+    *,
+    transit_model: np.ndarray | None = None,
+    physical=None,
 ) -> EventBaselineDraw:
     """Draw beta | y, theta for one event using the exact Phase 1C Gaussian conditional.
 
@@ -58,8 +66,9 @@ def draw_conditional_event_baseline(
     then samples beta from the conditional Normal distribution returned by the
     marginalized calculation. It does not refit or approximate the Gaussian path.
     """
-    sample = vector_to_physical(draw.vector, timing)
-    transit_model = transit_model_for_vector(draw.vector, data, config, timing)
+    sample = physical if physical is not None else vector_to_physical(draw.vector, timing)
+    if transit_model is None:
+        transit_model = transit_model_for_vector(draw.vector, data, config, timing)
     mask = data.event_number == int(event_number)
     if not np.any(mask):
         raise ValueError(f"Unknown event_number {event_number}.")
@@ -76,8 +85,8 @@ def draw_conditional_event_baseline(
         baseline_slope_sigma=config.baseline_slope_sigma,
     )
     covariance = np.asarray(result.baseline_covariance, dtype=float)
-    _validate_covariance(covariance)
-    coefficients = rng.multivariate_normal(np.asarray(result.baseline_mean, dtype=float), covariance)
+    eigenvalues, cholesky = _validate_covariance(covariance)
+    coefficients = np.asarray(result.baseline_mean, dtype=float) + cholesky @ rng.standard_normal(2)
     return EventBaselineDraw(
         event_number=int(event_number),
         coefficients=np.asarray(coefficients, dtype=float),
@@ -86,7 +95,8 @@ def draw_conditional_event_baseline(
         design_matrix=np.column_stack([event_model, event_model * x]),
         transit_model=np.asarray(event_model, dtype=float),
         local_coordinate=np.asarray(x, dtype=float),
-        covariance_eigenvalues=np.linalg.eigvalsh(covariance),
+        covariance_eigenvalues=eigenvalues,
+        cholesky_diagonal=np.diag(cholesky),
     )
 
 
@@ -96,6 +106,8 @@ def generate_replicated_flux(
     config: Phase1CConfig,
     timing: TimingReference,
     rng: np.random.Generator,
+    *,
+    replication_index: int = 0,
 ) -> tuple[dict[str, np.ndarray], list[dict[str, Any]]]:
     """Generate one posterior-predictive flux replicate aligned to frozen cadences.
 
@@ -105,6 +117,7 @@ def generate_replicated_flux(
     Observed residuals are never resampled.
     """
     sample = vector_to_physical(draw.vector, timing)
+    full_transit_model = transit_model_for_vector(draw.vector, data, config, timing)
     n_cadences = data.cadence_count
     model_flux = np.empty(n_cadences, dtype=float)
     predictive_mean = np.empty(n_cadences, dtype=float)
@@ -115,7 +128,16 @@ def generate_replicated_flux(
     baseline_audit = []
     for event in np.unique(data.event_number):
         mask = data.event_number == event
-        baseline = draw_conditional_event_baseline(draw, int(event), data, config, timing, rng)
+        baseline = draw_conditional_event_baseline(
+            draw,
+            int(event),
+            data,
+            config,
+            timing,
+            rng,
+            transit_model=full_transit_model,
+            physical=sample,
+        )
         mean = baseline.design_matrix @ baseline.coefficients
         variance = np.square(data.flux_uncertainty[mask]) + sample.jitter**2
         noise = rng.normal(0.0, np.sqrt(variance))
@@ -125,7 +147,7 @@ def generate_replicated_flux(
         replicated_flux[mask] = mean + noise
         baseline_intercept[mask] = baseline.coefficients[0]
         baseline_slope[mask] = baseline.coefficients[1]
-        baseline_audit.append(baseline.audit_record(draw))
+        baseline_audit.append(baseline.audit_record(draw, replication_index=replication_index))
     rows = {
         "cadence_index": np.arange(n_cadences, dtype=int),
         "time": np.asarray(data.time, dtype=float),
@@ -137,6 +159,10 @@ def generate_replicated_flux(
         "source_ensemble": np.full(n_cadences, draw.ensemble, dtype=int),
         "source_walker": np.full(n_cadences, draw.walker, dtype=int),
         "source_step": np.full(n_cadences, draw.step, dtype=int),
+        "source_run_id": np.full(n_cadences, draw.run_id, dtype=str),
+        "source_mode": np.full(n_cadences, draw.mode, dtype=str),
+        "selection_position": np.full(n_cadences, draw.selection_position, dtype=int),
+        "predictive_replication_index": np.full(n_cadences, replication_index, dtype=int),
         "model_flux": model_flux,
         "baseline_intercept": baseline_intercept,
         "baseline_slope": baseline_slope,
@@ -169,7 +195,7 @@ def write_development_predictive_output(
         json.dump(config_payload, output_file, indent=2)
 
 
-def _validate_covariance(covariance: np.ndarray) -> None:
+def _validate_covariance(covariance: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     if covariance.shape != (2, 2):
         raise ValueError("Baseline covariance must be 2x2.")
     if not np.all(np.isfinite(covariance)):
@@ -177,5 +203,10 @@ def _validate_covariance(covariance: np.ndarray) -> None:
     if not np.allclose(covariance, covariance.T, rtol=0.0, atol=1.0e-12):
         raise ValueError("Baseline covariance is not symmetric.")
     eigenvalues = np.linalg.eigvalsh(covariance)
-    if np.min(eigenvalues) < -1.0e-12:
-        raise ValueError("Baseline covariance is not positive semidefinite.")
+    if np.min(eigenvalues) <= 0.0:
+        raise ValueError("Baseline covariance is not positive definite.")
+    try:
+        cholesky = np.linalg.cholesky(covariance)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError("Baseline covariance Cholesky factorization failed.") from exc
+    return eigenvalues, cholesky

@@ -328,13 +328,20 @@ Phase 1C rejects confirmed input mismatches rather than modifying that snapshot.
 
 Phase 1D starts from existing Phase 1C checkpoints. The first implementation
 pass adds reusable, ensemble-aware posterior draw access and development-only
-posterior-predictive flux generation. It preserves the originating run ID,
-ensemble, walker, and stored HDF step for every selected draw; the draw subset
-is a posterior-predictive Monte Carlo subset, not posterior thinning.
+posterior-predictive flux generation. A validated source object binds the
+Phase 1C run directory, saved configuration, mode, frozen or reconstructed
+data, derived timing reference, HDF ensembles, diagnostics, checkpoint
+metadata, and input provenance before draw selection. Callers do not supply an
+independent timing reference. It preserves the originating run ID, mode,
+selection position, ensemble, walker, and stored HDF step for every selected
+draw; the draw subset is a posterior-predictive Monte Carlo subset, not
+posterior thinning.
 
 For each selected vector, Phase 1D reuses the Phase 1C transformations,
-BATMAN transit model, event-local coordinate, and exact Gaussian marginalized
-event likelihood. The local multiplicative baseline design is
+BATMAN transit model, event-local coordinate, checkpoint metadata validation,
+and exact Gaussian marginalized event likelihood. The full exposure-integrated
+transit model is evaluated once per posterior-predictive replicate and sliced
+by event for conditional-baseline draws. The local multiplicative baseline design is
 `X = [m, m*x]`, where `m` is the exposure-integrated transit model and `x` is
 the deterministic event-local coordinate. Conditional baseline coefficients are
 drawn from:
@@ -349,10 +356,12 @@ Replicated flux is generated at the frozen accepted cadences as:
 y_rep = X beta_draw + Normal(0, sigma_i^2 + jitter^2)
 ```
 
-The predictive noise is newly generated from cadence uncertainty and sampled
-jitter; observed residuals are not resampled. Ensemble provenance is retained
-so later predictive checks can audit whether behavior is concentrated in one
-independent ensemble or shared across the posterior.
+The covariance is sampled by Cholesky factorization after checking shape,
+finiteness, symmetry, and positive definiteness. The predictive noise is newly
+generated from cadence uncertainty and sampled jitter; observed residuals are
+not resampled. Ensemble provenance is retained so later predictive checks can
+audit whether behavior is concentrated in one independent ensemble or shared
+across the posterior.
 
 A bounded development mode can exercise this plumbing against a small existing
 Phase 1C run. Its outputs are labeled nonauthoritative and must not be used as
@@ -366,4 +375,7 @@ python -m exoplanet_search.cli --phase1d-development-predictive \
 
 Development outputs include a draw-selection manifest, selected-draw audit,
 event-baseline draw audit, predictive configuration, and a compressed NPZ file
-with cadence-aligned replicated flux arrays.
+with cadence-aligned replicated flux arrays. The NPZ and JSONL audit rows carry
+source run ID, source mode, selection position, predictive replication index,
+ensemble, walker, and stored step so every replicated cadence and event
+baseline can be traced back to its selected posterior draw.
