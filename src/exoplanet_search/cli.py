@@ -58,6 +58,18 @@ from .recovery import (
 )
 
 
+def _positive_integer_argument(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if str(parsed) != value.strip():
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -239,6 +251,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--phase1c-random-seed", type=int, default=20260715)
     parser.add_argument("--phase1c-run-id", default=None, help="Deterministic Phase 1C run ID for isolated outputs.")
     parser.add_argument("--phase1c-n-ensembles", type=int, default=4)
+    parser.add_argument("--phase1c-ensemble-processes", type=_positive_integer_argument, default=1)
     parser.add_argument("--phase1c-n-walkers", type=int, default=24)
     parser.add_argument("--phase1c-pilot-steps", type=int, default=24)
     parser.add_argument("--phase1c-synthetic-steps", type=int, default=80)
@@ -584,6 +597,7 @@ def _phase1c_config_from_args(args) -> Phase1CConfig:
         run_id=args.phase1c_run_id,
         random_seed=args.phase1c_random_seed,
         n_ensembles=args.phase1c_n_ensembles,
+        ensemble_processes=args.phase1c_ensemble_processes,
         n_walkers=args.phase1c_n_walkers,
         pilot_steps=args.phase1c_pilot_steps,
         synthetic_steps=args.phase1c_synthetic_steps,

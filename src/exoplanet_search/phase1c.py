@@ -37,6 +37,7 @@ from .phase1c_sampler import (
     checkpoint_metadata,
     dependency_versions,
     estimate_autocorrelation_time,
+    execution_provenance,
     load_backend_chains,
     load_backend_chains_by_ensemble,
     run_ensembles,
@@ -334,6 +335,7 @@ def _begin_invocation(
         "starting_iterations": starting_iterations,
         "target_total_steps": int(target_steps),
         "mutable_execution_controls": _mutable_execution_controls(config),
+        "execution_parallelism": execution_provenance(config),
         "git": {"commit": _git_output("rev-parse", "HEAD"), "status": _git_output("status", "--short")},
     }
     history.append(record)
@@ -381,6 +383,7 @@ def _mutable_execution_controls(config: Phase1CConfig) -> dict[str, Any]:
         "target_total_steps": config.target_total_steps,
         "additional_steps": config.additional_steps,
         "chunk_steps": config.chunk_steps,
+        "ensemble_processes": config.ensemble_processes,
         "max_pilot_seconds": config.max_pilot_seconds,
         "minimum_meaningful_summary_draws": config.minimum_meaningful_summary_draws,
     }
@@ -484,6 +487,7 @@ def _run_sampling_mode(
             chunk_callback=on_chunk,
         )
         elapsed = time.perf_counter() - start
+        invocation["execution_parallelism"] = execution_provenance(config, results)
         summary = _write_sampling_summaries(
             data,
             config,
@@ -594,6 +598,7 @@ def _write_sampling_summaries(
     runtime = {
         "mode": mode,
         "run_id": config.run_id,
+        "execution_parallelism": execution_provenance(config, results),
         "cumulative_totals": _cumulative_runtime_totals(
             config.output_dir,
             pending_calls=invocation_calls,
@@ -847,6 +852,7 @@ def build_phase1c_provenance(
         "dependencies": dependency_versions(),
         "phase1b_input_manifest": data.input_manifest,
         "phase1c_configuration": config.to_dict(),
+        "execution_parallelism": execution_provenance(config),
         "checkpoint_metadata": checkpoint_metadata(data, config, mode=mode),
         "diagnostic_methodology_version": config.diagnostic_methodology_version,
         "timing_reference": timing.__dict__,
@@ -991,6 +997,7 @@ def _ensemble_runtime_row(result) -> dict[str, Any]:
         "backend_path": str(result.backend_path),
         "iterations": result.iterations,
         "runtime_seconds": result.runtime_seconds,
+        "process_ids": [int(pid) for pid in getattr(result, "process_ids", ())],
         "acceptance_fraction_min": float(np.nanmin(result.acceptance_fraction)),
         "acceptance_fraction_median": float(np.nanmedian(result.acceptance_fraction)),
         "acceptance_fraction_max": float(np.nanmax(result.acceptance_fraction)),

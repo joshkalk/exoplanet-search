@@ -32,6 +32,7 @@ class Phase1CConfig:
     run_id: str | None = None
     random_seed: int = 20260715
     n_ensembles: int = 4
+    ensemble_processes: int = 1
     n_walkers: int = 24
     pilot_steps: int = 24
     synthetic_steps: int = 80
@@ -98,6 +99,11 @@ class Phase1CConfig:
             )
         if int(self.autocorrelation_min_usable_walkers) < 2:
             raise ValueError("autocorrelation_min_usable_walkers must be at least 2.")
+        ensemble_processes = _require_integer(self.ensemble_processes, "ensemble_processes")
+        if ensemble_processes <= 0:
+            raise ValueError("ensemble_processes must be positive.")
+        if ensemble_processes > int(self.n_ensembles):
+            raise ValueError("ensemble_processes cannot exceed n_ensembles.")
         initial_pool_size = _require_integer(self.prior_informed_pool_size, "prior_informed_pool_size")
         max_pool_size = _require_integer(
             self.prior_informed_max_pool_size,

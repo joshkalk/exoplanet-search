@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
+import multiprocessing
+import os
 import platform
 import time
 from dataclasses import dataclass
@@ -29,6 +32,14 @@ from .phase1c_types import FrozenPhase1BData, PARAMETER_ORDER, Phase1CConfig, Ti
 
 LOCAL_STRATEGIES = ("local_tight", "local_moderate", "local_broad")
 PRIOR_STRATEGY = "prior_informed"
+THREAD_LIMIT_ENV_VARS = (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "BLIS_NUM_THREADS",
+)
 
 
 @dataclass(frozen=True)
@@ -44,6 +55,7 @@ class EnsembleRunResult:
     acceptance_fraction: np.ndarray
     initialization_summary: dict[str, Any]
     profiler_summary: dict[str, Any]
+    process_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -94,10 +106,44 @@ def run_ensembles(
     mode: str,
     resume: bool = False,
     chunk_callback: Callable[[list[EnsembleRunResult], float, dict[str, Any]], None] | None = None,
+    _failure_injection: dict[str, Any] | None = None,
 ) -> list[EnsembleRunResult]:
     """Run independent chunked emcee ensembles with HDF checkpoint backends."""
     if config.n_walkers < 2 * len(PARAMETER_ORDER):
         raise ValueError("Phase 1C requires at least 2 * ndim emcee walkers.")
+    if int(config.ensemble_processes) == 1:
+        return _run_ensembles_sequential(
+            data,
+            config,
+            timing,
+            steps=steps,
+            mode=mode,
+            resume=resume,
+            chunk_callback=chunk_callback,
+        )
+    return _run_ensembles_process_parallel(
+        data,
+        config,
+        timing,
+        steps=steps,
+        mode=mode,
+        resume=resume,
+        chunk_callback=chunk_callback,
+        failure_injection=_failure_injection,
+    )
+
+
+def _run_ensembles_sequential(
+    data: FrozenPhase1BData,
+    config: Phase1CConfig,
+    timing: TimingReference,
+    *,
+    steps: int,
+    mode: str,
+    resume: bool,
+    chunk_callback: Callable[[list[EnsembleRunResult], float, dict[str, Any]], None] | None,
+) -> list[EnsembleRunResult]:
+    """Run independent chunked emcee ensembles in the current process."""
     output_dir = config.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     metadata = checkpoint_metadata(data, config, mode=mode)
@@ -116,8 +162,11 @@ def run_ensembles(
         strategy = initialization_strategy(ensemble_index, config.n_ensembles)
         backend_path = output_dir / f"ensemble_{ensemble_index:02d}.h5"
         backend = emcee.backends.HDFBackend(str(backend_path))
-        if resume:
+        if resume and backend_path.exists() and backend.iteration > 0:
             validate_checkpoint_metadata(backend_path, metadata, seed)
+        elif resume:
+            validate_checkpoint_metadata(backend_path, metadata, seed)
+            raise ValueError(f"Cannot resume zero-iteration Phase 1C checkpoint: {backend_path}")
         else:
             backend.reset(config.n_walkers, len(PARAMETER_ORDER))
             write_checkpoint_metadata(backend_path, metadata, seed)
@@ -128,6 +177,8 @@ def run_ensembles(
             ProfiledLogPosterior(likelihood_context, profiler),
             backend=backend,
         )
+        if int(backend.iteration) == 0:
+            sampler.random_state = _emcee_random_state(seed)
         rng = np.random.default_rng(seed)
         if resume and backend.iteration > 0:
             initial_state = None
@@ -192,6 +243,293 @@ def run_ensembles(
         initialization_summaries,
         runtime_starts,
     )
+
+
+def _run_ensembles_process_parallel(
+    data: FrozenPhase1BData,
+    config: Phase1CConfig,
+    timing: TimingReference,
+    *,
+    steps: int,
+    mode: str,
+    resume: bool,
+    chunk_callback: Callable[[list[EnsembleRunResult], float, dict[str, Any]], None] | None,
+    failure_injection: dict[str, Any] | None = None,
+) -> list[EnsembleRunResult]:
+    """Run independent ensembles in spawn workers, synchronized at global chunks."""
+    output_dir = config.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    requested_processes = int(config.ensemble_processes)
+    if requested_processes > int(config.n_ensembles):
+        raise ValueError("ensemble_processes cannot exceed n_ensembles.")
+
+    previous_thread_env = _set_thread_limit_environment()
+    context = multiprocessing.get_context("spawn")
+    global_start = time.perf_counter()
+    initialization_summaries: list[dict[str, Any] | None] = [None] * int(config.n_ensembles)
+    profiler_summaries: list[dict[str, Any]] = [{} for _ in range(int(config.n_ensembles))]
+    runtime_seconds = [0.0 for _ in range(int(config.n_ensembles))]
+    process_ids: list[set[int]] = [set() for _ in range(int(config.n_ensembles))]
+    latest_results: list[EnsembleRunResult | None] = [None] * int(config.n_ensembles)
+
+    try:
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=requested_processes,
+            mp_context=context,
+        ) as executor:
+            while True:
+                iterations = _stored_backend_iterations(output_dir, config.n_ensembles)
+                remaining = max(int(steps) - min(iterations), 0)
+                if remaining <= 0:
+                    break
+                chunk = min(int(config.chunk_steps), remaining)
+                futures = {}
+                for ensemble_index, iteration in enumerate(iterations):
+                    current_remaining = max(int(steps) - int(iteration), 0)
+                    if current_remaining <= 0:
+                        continue
+                    task = {
+                        "data": data,
+                        "config": config,
+                        "timing": timing,
+                        "mode": mode,
+                        "resume": bool(resume),
+                        "ensemble_index": int(ensemble_index),
+                        "target_steps": int(steps),
+                        "chunk_steps": int(min(chunk, current_remaining)),
+                        "failure_injection": failure_injection,
+                    }
+                    futures[executor.submit(_run_ensemble_chunk_worker, task)] = ensemble_index
+                if not futures:
+                    break
+                done, pending = concurrent.futures.wait(
+                    futures,
+                    return_when=concurrent.futures.FIRST_EXCEPTION,
+                )
+                first_error = next((future.exception() for future in done if future.exception() is not None), None)
+                if first_error is not None:
+                    pending_indices = [futures[future] for future in pending]
+                    for future in pending:
+                        future.cancel()
+                    raise RuntimeError(
+                        "Phase 1C process-parallel ensemble chunk failed; "
+                        f"pending ensembles cancelled={pending_indices}; "
+                        f"worker_error={first_error}"
+                    ) from first_error
+                concurrent.futures.wait(pending)
+                ordered = [future.result() for future in futures]
+                ordered.sort(key=lambda result: result.ensemble_index)
+                for result in ordered:
+                    index = int(result.ensemble_index)
+                    if initialization_summaries[index] is None:
+                        initialization_summaries[index] = result.initialization_summary
+                    profiler_summaries[index] = _sum_profiler_summaries(
+                        profiler_summaries[index],
+                        result.profiler_summary,
+                    )
+                    runtime_seconds[index] += float(result.runtime_seconds)
+                    process_ids[index].update(int(pid) for pid in result.process_ids)
+                    latest_results[index] = EnsembleRunResult(
+                        ensemble_index=result.ensemble_index,
+                        seed=result.seed,
+                        strategy=result.strategy,
+                        backend_path=result.backend_path,
+                        iterations=result.iterations,
+                        runtime_seconds=float(runtime_seconds[index]),
+                        acceptance_fraction=result.acceptance_fraction,
+                        initialization_summary=initialization_summaries[index] or result.initialization_summary,
+                        profiler_summary=profiler_summaries[index],
+                        process_ids=tuple(sorted(process_ids[index])),
+                    )
+                current_results = _ordered_completed_results(latest_results)
+                if chunk_callback is not None:
+                    chunk_callback(
+                        current_results,
+                        max(time.perf_counter() - global_start, 0.0),
+                        _aggregate_profiler_summary_dicts(profiler_summaries),
+                    )
+    finally:
+        _restore_thread_limit_environment(previous_thread_env)
+
+    return _ordered_completed_results(latest_results)
+
+
+def _run_ensemble_chunk_worker(task: dict[str, Any]) -> EnsembleRunResult:
+    """Spawn-safe worker entry point for one ensemble chunk."""
+    _set_thread_limit_environment()
+    data: FrozenPhase1BData = task["data"]
+    config: Phase1CConfig = task["config"]
+    timing: TimingReference = task["timing"]
+    mode = str(task["mode"])
+    ensemble_index = int(task["ensemble_index"])
+    seed = int(config.random_seed + 1000 * ensemble_index)
+    strategy = initialization_strategy(ensemble_index, config.n_ensembles)
+    backend_path = Path(config.output_dir) / f"ensemble_{ensemble_index:02d}.h5"
+    current_iteration = _backend_iteration(backend_path)
+    requested_chunk = int(task["chunk_steps"])
+    failure_injection = task.get("failure_injection")
+    start = time.perf_counter()
+    try:
+        if failure_injection and int(failure_injection.get("ensemble_index", -1)) == ensemble_index:
+            raise RuntimeError(str(failure_injection.get("message", "forced ensemble task failure")))
+        metadata = checkpoint_metadata(data, config, mode=mode)
+        likelihood_context = Phase1CLikelihoodContext.from_data(data, config, timing)
+        backend = emcee.backends.HDFBackend(str(backend_path))
+        if current_iteration > 0:
+            validate_checkpoint_metadata(backend_path, metadata, seed)
+            initial_state = None
+            initialization_summary = _resume_initialization_summary(strategy, seed)
+        elif bool(task["resume"]):
+            validate_checkpoint_metadata(backend_path, metadata, seed)
+            raise ValueError(f"Cannot resume zero-iteration Phase 1C checkpoint: {backend_path}")
+        else:
+            backend.reset(config.n_walkers, len(PARAMETER_ORDER))
+            write_checkpoint_metadata(backend_path, metadata, seed)
+            rng = np.random.default_rng(seed)
+            initialization = build_initialization(
+                data,
+                config,
+                timing,
+                rng,
+                strategy,
+                seed,
+                context=likelihood_context,
+            )
+            initial_state = initialization.walkers
+            initialization_summary = initialization.summary
+        profiler = PosteriorProfiler()
+        sampler = emcee.EnsembleSampler(
+            config.n_walkers,
+            len(PARAMETER_ORDER),
+            ProfiledLogPosterior(likelihood_context, profiler),
+            backend=backend,
+        )
+        if int(backend.iteration) == 0:
+            sampler.random_state = _emcee_random_state(seed)
+        current_remaining = max(int(task["target_steps"]) - int(backend.iteration), 0)
+        if current_remaining > 0:
+            sampler.run_mcmc(
+                initial_state,
+                min(requested_chunk, current_remaining),
+                progress=False,
+                skip_initial_state_check=True,
+            )
+        runtime = time.perf_counter() - start
+        return EnsembleRunResult(
+            ensemble_index=ensemble_index,
+            seed=seed,
+            strategy=strategy,
+            backend_path=backend_path,
+            iterations=int(sampler.backend.iteration),
+            runtime_seconds=float(runtime),
+            acceptance_fraction=np.asarray(sampler.acceptance_fraction, dtype=float),
+            initialization_summary=initialization_summary,
+            profiler_summary=profiler.summary(),
+            process_ids=(os.getpid(),),
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Phase 1C ensemble worker failed: "
+            f"ensemble_index={ensemble_index}; "
+            f"seed={seed}; "
+            f"strategy={strategy}; "
+            f"backend_path={backend_path}; "
+            f"current_iteration={current_iteration}; "
+            f"requested_chunk={requested_chunk}; "
+            f"original_error={type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def _stored_backend_iterations(output_dir: Path, n_ensembles: int) -> list[int]:
+    return [_backend_iteration(output_dir / f"ensemble_{index:02d}.h5") for index in range(int(n_ensembles))]
+
+
+def _backend_iteration(path: Path) -> int:
+    if not path.exists():
+        return 0
+    try:
+        backend = emcee.backends.HDFBackend(str(path), read_only=True)
+        return int(backend.iteration)
+    except (OSError, AttributeError):
+        return 0
+
+
+def _ordered_completed_results(results: list[EnsembleRunResult | None]) -> list[EnsembleRunResult]:
+    missing = [index for index, result in enumerate(results) if result is None]
+    if missing:
+        raise RuntimeError(f"Phase 1C ensemble results are incomplete for ensembles: {missing}")
+    return [result for result in results if result is not None]
+
+
+def _sum_profiler_summaries(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    keys = set(left) | set(right)
+    total: dict[str, Any] = {}
+    for key in keys:
+        first = left.get(key, 0.0)
+        second = right.get(key, 0.0)
+        if isinstance(first, float) or isinstance(second, float):
+            total[key] = float(first) + float(second)
+        else:
+            total[key] = int(first) + int(second)
+    return total
+
+
+def _aggregate_profiler_summary_dicts(summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    aggregate: dict[str, Any] = {}
+    for summary in summaries:
+        aggregate = _sum_profiler_summaries(aggregate, summary)
+    return aggregate
+
+
+def _emcee_random_state(seed: int) -> tuple[Any, ...]:
+    return np.random.RandomState(int(seed)).get_state()
+
+
+def _set_thread_limit_environment() -> dict[str, str | None]:
+    previous = {name: os.environ.get(name) for name in THREAD_LIMIT_ENV_VARS}
+    for name in THREAD_LIMIT_ENV_VARS:
+        os.environ[name] = "1"
+    return previous
+
+
+def _restore_thread_limit_environment(previous: dict[str, str | None]) -> None:
+    for name, value in previous.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
+
+def execution_provenance(config: Phase1CConfig, results: list[EnsembleRunResult] | None = None) -> dict[str, Any]:
+    """Return execution-only process/thread metadata for runtime provenance."""
+    requested = int(config.ensemble_processes)
+    effective = min(requested, int(config.n_ensembles))
+    worker_pids: dict[str, list[int]] = {}
+    per_ensemble_runtime: dict[str, float] = {}
+    if results is not None:
+        worker_pids = {
+            str(result.ensemble_index): [int(pid) for pid in result.process_ids]
+            for result in sorted(results, key=lambda item: item.ensemble_index)
+        }
+        per_ensemble_runtime = {
+            str(result.ensemble_index): float(result.runtime_seconds)
+            for result in sorted(results, key=lambda item: item.ensemble_index)
+        }
+    return {
+        "requested_ensemble_processes": requested,
+        "effective_ensemble_processes": effective,
+        "execution_mode": "sequential" if effective == 1 else "process_parallel",
+        "multiprocessing_start_method": None if effective == 1 else "spawn",
+        "thread_limit_environment": {name: "1" for name in THREAD_LIMIT_ENV_VARS},
+        "thread_limit_policy": (
+            "Process-parallel Phase 1C workers inherit one-thread numerical-library limits "
+            "and set the same limits again at worker entry."
+            if effective > 1
+            else "Sequential Phase 1C execution does not alter process-level numerical-library thread settings."
+        ),
+        "worker_process_ids": worker_pids,
+        "per_ensemble_runtime_seconds": per_ensemble_runtime,
+    }
 
 
 def initialization_strategy(ensemble_index: int, n_ensembles: int) -> str:
@@ -649,6 +987,7 @@ def immutable_checkpoint_identity(
         "target_total_steps",
         "additional_steps",
         "chunk_steps",
+        "ensemble_processes",
         "max_pilot_seconds",
         "minimum_meaningful_summary_draws",
     ):
@@ -749,6 +1088,7 @@ def _current_results(
                 acceptance_fraction=np.asarray(sampler.acceptance_fraction, dtype=float),
                 initialization_summary=initialization_summaries[index],
                 profiler_summary=profilers[index].summary(),
+                process_ids=(os.getpid(),),
             )
         )
     return results
