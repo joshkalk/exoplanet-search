@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -12,6 +13,7 @@ from exoplanet_search.phase1c_sampler import (
     build_initialization,
     checkpoint_metadata,
     deterministic_center_vector,
+    validate_initialization_cloud,
 )
 from exoplanet_search.phase1c_types import PARAMETER_ORDER, Phase1CConfig
 from exoplanet_search.phase1d_draws import load_phase1c_config
@@ -26,6 +28,7 @@ def test_prior_informed_initialization_is_reproducible_and_coherent(tmp_path):
         prior_informed_max_pool_size=512,
         prior_informed_elite_size=8,
         prior_informed_min_finite_candidates=4,
+        maximum_initial_logp_deficit=30.0,
         prior_informed_max_logp_deficit=30.0,
     )
     data, timing, _ = synthetic_dataset(config)
@@ -75,10 +78,15 @@ def test_prior_informed_initialization_is_reproducible_and_coherent(tmp_path):
     assert isinstance(metadata["selected_anchor_pool_index"], int)
     assert metadata["selected_anchor_rank_by_log_posterior"] <= config.prior_informed_elite_size
     assert metadata["selected_anchor_log_posterior_deficit"] <= config.prior_informed_max_logp_deficit
+    assert metadata["authoritative_maximum_initial_logp_deficit"] == config.maximum_initial_logp_deficit
     assert distance > 2.0
     assert not np.array_equal(anchor, center)
     assert np.all(np.isfinite(cloud_logp))
     assert np.max(cloud_deficit) <= config.prior_informed_max_logp_deficit
+    assert np.max(cloud_deficit) <= config.maximum_initial_logp_deficit
+    assert first.summary["maximum_initial_logp_deficit"] == 30.0
+    assert first.summary["initialization_validation"]["passed"] is True
+    assert len(first.summary["walker_initialization_rows"]) == config.n_walkers
     assert metadata["cloud_log_posterior_range"]["min"] == pytest.approx(float(np.min(cloud_logp)))
     assert metadata["cloud_minimum_log_posterior_deficit"] == pytest.approx(float(np.max(cloud_deficit)))
     assert set(metadata["rejection_counts"]) == {"nonfinite", "below_floor"}
@@ -94,6 +102,7 @@ def test_prior_informed_initialization_raises_without_eligible_candidates(tmp_pa
         prior_informed_max_pool_size=8,
         prior_informed_elite_size=4,
         prior_informed_min_finite_candidates=4,
+        maximum_initial_logp_deficit=1.0e-12,
         prior_informed_max_logp_deficit=1.0e-12,
     )
     data, timing, _ = synthetic_dataset(config)
@@ -120,6 +129,7 @@ def test_prior_informed_initialization_raises_when_eligible_count_is_too_low(tmp
         prior_informed_max_pool_size=64,
         prior_informed_elite_size=4,
         prior_informed_min_finite_candidates=1000,
+        maximum_initial_logp_deficit=30.0,
         prior_informed_max_logp_deficit=30.0,
     )
     data, timing, _ = synthetic_dataset(config)
@@ -148,6 +158,7 @@ def test_failed_pilot_seed_expands_to_2048_and_keeps_thresholds(tmp_path):
         prior_informed_pool_growth_factor=2,
         prior_informed_elite_size=16,
         prior_informed_min_finite_candidates=8,
+        maximum_initial_logp_deficit=30.0,
         prior_informed_max_logp_deficit=30.0,
     )
     data, timing, _ = synthetic_dataset(config)
@@ -311,8 +322,10 @@ def test_phase1c_config_validation_and_legacy_loading(tmp_path):
         Phase1CConfig(prior_informed_min_finite_candidates=0)
     with pytest.raises(ValueError, match="elite_size"):
         Phase1CConfig(prior_informed_elite_size=0)
-    with pytest.raises(ValueError, match="max_logp_deficit"):
-        Phase1CConfig(prior_informed_max_logp_deficit=np.inf)
+    with pytest.raises(ValueError, match="maximum_initial_logp_deficit"):
+        Phase1CConfig(maximum_initial_logp_deficit=np.inf, prior_informed_max_logp_deficit=np.inf)
+    with pytest.raises(ValueError, match="exactly match"):
+        Phase1CConfig(maximum_initial_logp_deficit=30.0, prior_informed_max_logp_deficit=29.0)
 
     run_dir = tmp_path / "old_config"
     run_dir.mkdir()
@@ -331,6 +344,8 @@ def test_phase1c_config_validation_and_legacy_loading(tmp_path):
     assert loaded.prior_informed_max_logp_deficit == 30.0
     assert stored.prior_informed_max_pool_size == 8192
     assert stored.prior_informed_pool_growth_factor == 2
+    assert loaded.sampler_move_strategy == "stretch_v1"
+    assert stored.sampler_move_strategy == "stretch_v1"
 
     serialized = loaded.to_dict()
     assert serialized["prior_informed_max_pool_size"] == 8192
@@ -340,6 +355,15 @@ def test_phase1c_config_validation_and_legacy_loading(tmp_path):
     identity_config = identity["priors_and_transforms"]["configuration"]
     assert identity_config["prior_informed_max_pool_size"] == 8192
     assert identity_config["prior_informed_pool_growth_factor"] == 2
+    assert identity_config["sampler_move_strategy"] == "stretch_v1"
+
+    bad_dir = tmp_path / "bad_config"
+    bad_dir.mkdir()
+    bad_payload = Phase1CConfig(output_dir=bad_dir, run_id="bad").to_dict()
+    bad_payload["sampler_move_strategy"] = "not_real"
+    (bad_dir / "phase1c_configuration.json").write_text(json.dumps(bad_payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="sampler_move_strategy"):
+        _stored_phase1c_config(Phase1CConfig(output_dir=bad_dir, run_id="bad"))
 
 
 def test_local_initialization_strategies_keep_existing_behavior(tmp_path):
@@ -356,12 +380,107 @@ def test_local_initialization_strategies_keep_existing_behavior(tmp_path):
             strategy,
             100 + index,
         )
+        context = Phase1CLikelihoodContext.from_data(data, config, timing)
+        logp = np.asarray([log_probability_with_context(row, context) for row in initialization.walkers])
+        deficits = initialization.summary["deterministic_center_log_posterior"] - logp
         assert initialization.walkers.shape == (24, len(PARAMETER_ORDER))
         assert initialization.summary["strategy"] == strategy
         assert "prior_informed_remote_anchor" not in initialization.summary
         assert initialization.summary["rank"] == len(PARAMETER_ORDER)
+        assert np.max(deficits) <= config.maximum_initial_logp_deficit
+        assert set(initialization.summary["rejection_counts"]) == {"nonfinite", "below_floor"}
+        assert initialization.summary["initialization_validation"]["passed"] is True
         assert abs(np.median(initialization.walkers[:, 6] - center[6])) < 3.0e-4
         assert abs(np.median(initialization.walkers[:, 7] - center[7])) < 7.5e-3
+
+
+def test_initialization_uses_no_injected_truth_record(tmp_path):
+    config = Phase1CConfig(output_dir=tmp_path / "synthetic", n_ensembles=4, n_walkers=16)
+    data, timing, _ = synthetic_dataset(config)
+    altered_manifest = json.loads(json.dumps(data.input_manifest))
+    altered_manifest.setdefault("synthetic_dataset_identity", {})["injected_parameters"] = {"rp_over_rstar": 999.0}
+    altered_data = replace(data, input_manifest=altered_manifest)
+
+    first = build_initialization(data, config, timing, np.random.default_rng(123), "local_tight", 123)
+    second = build_initialization(altered_data, config, timing, np.random.default_rng(123), "local_tight", 123)
+
+    assert np.array_equal(first.walkers, second.walkers)
+    assert first.summary == second.summary
+
+
+def test_local_initialization_distinguishes_rejection_reasons(monkeypatch, tmp_path):
+    config = Phase1CConfig(output_dir=tmp_path / "synthetic", n_ensembles=1, n_walkers=16)
+    data, timing, _ = synthetic_dataset(config)
+    values = iter([0.0, -np.inf, -100.0, *([0.0] * 16)])
+
+    def fake_log_probability_with_context(vector, context):
+        del vector, context
+        return next(values)
+
+    monkeypatch.setattr(phase1c_sampler, "log_probability_with_context", fake_log_probability_with_context)
+    initialization = build_initialization(data, config, timing, np.random.default_rng(1), "local_tight", 1)
+
+    assert initialization.summary["rejection_counts"] == {"nonfinite": 1, "below_floor": 1}
+
+
+def test_local_initialization_fails_without_eligible_cloud(monkeypatch, tmp_path):
+    config = Phase1CConfig(output_dir=tmp_path / "synthetic", n_ensembles=1, n_walkers=4)
+    data, timing, _ = synthetic_dataset(config)
+    calls = {"count": 0}
+
+    def fake_log_probability_with_context(vector, context):
+        del vector, context
+        calls["count"] += 1
+        return 0.0 if calls["count"] == 1 else -100.0
+
+    monkeypatch.setattr(phase1c_sampler, "log_probability_with_context", fake_log_probability_with_context)
+    with pytest.raises(RuntimeError, match="posterior-eligible"):
+        build_initialization(data, config, timing, np.random.default_rng(1), "local_tight", 1)
+
+
+def test_initialization_validation_rejects_duplicate_and_near_duplicate_clouds(tmp_path):
+    config = Phase1CConfig(output_dir=tmp_path / "synthetic", n_ensembles=1, n_walkers=16)
+    data, timing, _ = synthetic_dataset(config)
+    context = Phase1CLikelihoodContext.from_data(data, config, timing)
+    center = deterministic_center_vector(data, config, timing)
+    center_logp = float(log_probability_with_context(center, context))
+    scales = np.asarray(config.local_tight_scales, dtype=float)
+    rng = np.random.default_rng(42)
+    cloud = center + rng.normal(0.0, scales, size=(config.n_walkers, len(PARAMETER_ORDER)))
+    cloud = np.asarray([phase1c_sampler._clip_local_candidate(row, config, timing) for row in cloud])
+    logp = np.asarray([log_probability_with_context(row, context) for row in cloud])
+
+    duplicate = cloud.copy()
+    duplicate[1] = duplicate[0]
+    with pytest.raises(RuntimeError, match="initialization validation failed"):
+        validate_initialization_cloud(
+            duplicate,
+            logp,
+            data,
+            config,
+            timing,
+            center,
+            center_logp,
+            strategy="local_tight",
+            scales=scales,
+            rejection_counts={"nonfinite": 0, "below_floor": 0},
+        )
+
+    near = cloud.copy()
+    near[1] = near[0] + scales * 1.0e-10
+    with pytest.raises(RuntimeError, match="initialization validation failed"):
+        validate_initialization_cloud(
+            near,
+            logp,
+            data,
+            config,
+            timing,
+            center,
+            center_logp,
+            strategy="local_tight",
+            scales=scales,
+            rejection_counts={"nonfinite": 0, "below_floor": 0},
+        )
 
 
 def _patch_indexed_candidate_pool(monkeypatch, *, eligible_indices):

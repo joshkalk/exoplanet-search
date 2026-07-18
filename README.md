@@ -274,6 +274,21 @@ real-data pilot. Posterior predictive checks, Student's-t reweighting,
 supersampling-21 reweighting, broader limb-darkening sensitivity checks, and
 fixed-limb-darkening posterior runs remain pending.
 
+The sampler move strategy is explicit and checkpointed so resumed runs cannot
+silently change kernels. `stretch_v1` is the legacy single
+`emcee.moves.StretchMove(a=2.0)` strategy; `de_snooker_v1` is the redesigned
+mixture of `emcee.moves.DEMove()` at weight 0.8 and
+`emcee.moves.DESnookerMove()` at weight 0.2. Fresh initialization keeps the
+four deterministic ensemble strategies (`local_tight`, `local_moderate`,
+`local_broad`, `prior_informed`) but screens every proposed walker through the
+production posterior path, requiring a finite log posterior within the
+configured center-relative deficit without using injected synthetic truth. This
+screen is only an initialization quality gate, not posterior sampling; warmup
+draws are still discarded, and no walker repair, relocation, deletion, or
+adaptive move-weight change is permitted after sampling begins. A future
+realistic recovery should pass a cheap early health precursor before a full
+recovery run is launched.
+
 Validate the frozen Phase 1B inputs and write checksums. Each Phase 1C
 invocation writes to an isolated run directory under the configured output
 base; pass `--phase1c-run-id` for a deterministic directory name:

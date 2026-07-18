@@ -21,6 +21,7 @@ PARAMETER_ORDER = (
 )
 
 DIAGNOSTIC_METHODOLOGY_VERSION = "phase1c_emcee_ensemble_state_v2"
+SAMPLER_MOVE_STRATEGIES = ("stretch_v1", "de_snooker_v1")
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,7 @@ class Phase1CConfig:
     additional_steps: int | None = None
     chunk_steps: int = 12
     warmup_steps: int = 8
+    sampler_move_strategy: str = "stretch_v1"
     supersample_factor: int = 11
     rp_bounds: tuple[float, float] = (0.001, 0.35)
     a_bounds: tuple[float, float] = (1.01, 100.0)
@@ -72,6 +74,7 @@ class Phase1CConfig:
     prior_informed_pool_scale_multiplier: float = 0.8
     prior_informed_elite_size: int = 16
     prior_informed_min_finite_candidates: int = 8
+    maximum_initial_logp_deficit: float = 30.0
     prior_informed_max_logp_deficit: float = 30.0
     local_tight_scales: tuple[float, ...] = (0.015, 0.02, 0.015, 0.015, 0.015, 0.05, 1.0e-5, 2.0e-4)
     local_moderate_scales: tuple[float, ...] = (0.04, 0.05, 0.04, 0.04, 0.04, 0.12, 5.0e-5, 1.0e-3)
@@ -97,6 +100,8 @@ class Phase1CConfig:
                 "diagnostic_methodology_version must equal "
                 f"{DIAGNOSTIC_METHODOLOGY_VERSION!r}."
             )
+        if str(self.sampler_move_strategy) not in SAMPLER_MOVE_STRATEGIES:
+            raise ValueError(f"sampler_move_strategy must be one of {SAMPLER_MOVE_STRATEGIES}.")
         if int(self.autocorrelation_min_usable_walkers) < 2:
             raise ValueError("autocorrelation_min_usable_walkers must be at least 2.")
         ensemble_processes = _require_integer(self.ensemble_processes, "ensemble_processes")
@@ -131,6 +136,21 @@ class Phase1CConfig:
         if float(self.prior_informed_pool_scale_multiplier) <= 0.0:
             raise ValueError("prior_informed_pool_scale_multiplier must be positive.")
         if (
+            not np.isfinite(float(self.maximum_initial_logp_deficit))
+            or float(self.maximum_initial_logp_deficit) <= 0.0
+        ):
+            raise ValueError("maximum_initial_logp_deficit must be finite and positive.")
+        if not np.isclose(
+            float(self.prior_informed_max_logp_deficit),
+            float(self.maximum_initial_logp_deficit),
+            rtol=0.0,
+            atol=0.0,
+        ):
+            raise ValueError(
+                "prior_informed_max_logp_deficit must exactly match maximum_initial_logp_deficit; "
+                "use maximum_initial_logp_deficit as the authoritative setting."
+            )
+        if (
             not np.isfinite(float(self.prior_informed_max_logp_deficit))
             or float(self.prior_informed_max_logp_deficit) <= 0.0
         ):
@@ -154,6 +174,14 @@ class Phase1CConfig:
             "prior_informed_initialization": (
                 "Broad prior pool is posterior-screened to select one remote anchor, then walkers "
                 "start as a coherent local cloud around that anchor."
+            ),
+            "sampler_move_strategy": (
+                "Explicit emcee move strategy; legacy configurations without this field are interpreted "
+                "as stretch_v1."
+            ),
+            "initialization_screening": (
+                "Every fresh walker must be finite and within maximum_initial_logp_deficit of the "
+                "deterministic Phase 1B-derived center; injected synthetic truth is not used."
             ),
         }
         return values

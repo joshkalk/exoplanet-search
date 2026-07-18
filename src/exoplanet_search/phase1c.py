@@ -32,6 +32,7 @@ from .phase1c_parameters import (
     timing_support_audit,
 )
 from .phase1c_sampler import (
+    canonical_sampler_move_configuration,
     checkpoint_metadata,
     dependency_versions,
     estimate_autocorrelation_time,
@@ -280,6 +281,7 @@ def _stored_phase1c_config(config: Phase1CConfig) -> Phase1CConfig:
     payload = _read_json(path)
     payload.pop("parameter_order", None)
     payload.pop("notes", None)
+    payload.pop("sampler_move_configuration", None)
     path_fields = {"phase1b_output_dir", "output_dir"}
     tuple_fields = {
         "rp_bounds",
@@ -297,6 +299,11 @@ def _stored_phase1c_config(config: Phase1CConfig) -> Phase1CConfig:
     if "prior_informed_cloud_logp_drop" in payload:
         payload.setdefault("prior_informed_max_logp_deficit", payload["prior_informed_cloud_logp_drop"])
         payload.pop("prior_informed_cloud_logp_drop", None)
+    if "maximum_initial_logp_deficit" not in payload and "prior_informed_max_logp_deficit" in payload:
+        payload["maximum_initial_logp_deficit"] = payload["prior_informed_max_logp_deficit"]
+    if "prior_informed_max_logp_deficit" not in payload and "maximum_initial_logp_deficit" in payload:
+        payload["prior_informed_max_logp_deficit"] = payload["maximum_initial_logp_deficit"]
+    payload.setdefault("sampler_move_strategy", "stretch_v1")
     stored = Phase1CConfig(**payload)
     return replace(stored, output_dir=config.output_dir, run_id=config.run_id)
 
@@ -654,7 +661,9 @@ def _write_common_inputs(
     immutable: bool = False,
 ) -> None:
     writer = _write_json_if_absent if immutable else write_json
-    writer(config.output_dir / "phase1c_configuration.json", config.to_dict())
+    configuration = config.to_dict()
+    configuration["sampler_move_configuration"] = canonical_sampler_move_configuration(config.sampler_move_strategy)
+    writer(config.output_dir / "phase1c_configuration.json", configuration)
     writer(config.output_dir / "parameter_transformations.json", prior_description(data, config, timing))
     writer(config.output_dir / "timing_support_audit.json", timing_audit)
     writer(config.output_dir / "provenance_manifest.json", build_phase1c_provenance(data, config, timing, mode=mode))
@@ -708,6 +717,7 @@ def _write_sampling_summaries(
     runtime = {
         "mode": mode,
         "run_id": config.run_id,
+        "sampler_move_configuration": canonical_sampler_move_configuration(config.sampler_move_strategy),
         "execution_parallelism": execution_provenance(config, results),
         "cumulative_totals": _cumulative_runtime_totals(
             config.output_dir,
@@ -878,6 +888,7 @@ def build_phase1c_provenance(
         "phase1b_input_manifest": data.input_manifest,
         "synthetic_dataset_identity": data.input_manifest.get("synthetic_dataset_identity"),
         "phase1c_configuration": config.to_dict(),
+        "sampler_move_configuration": canonical_sampler_move_configuration(config.sampler_move_strategy),
         "execution_parallelism": execution_provenance(config),
         "checkpoint_metadata": checkpoint_metadata(data, config, mode=mode),
         "diagnostic_methodology_version": config.diagnostic_methodology_version,
@@ -1384,6 +1395,9 @@ def _ensemble_runtime_row(result) -> dict[str, Any]:
         "iterations": result.iterations,
         "runtime_seconds": result.runtime_seconds,
         "process_ids": [int(pid) for pid in getattr(result, "process_ids", ())],
+        "sampler_move_configuration": canonical_sampler_move_configuration(
+            getattr(result, "sampler_move_strategy", None) or "stretch_v1"
+        ),
         "acceptance_fraction_min": float(np.nanmin(result.acceptance_fraction)),
         "acceptance_fraction_median": float(np.nanmedian(result.acceptance_fraction)),
         "acceptance_fraction_max": float(np.nanmax(result.acceptance_fraction)),

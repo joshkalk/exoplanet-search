@@ -12,6 +12,7 @@ from exoplanet_search.cli import build_parser
 from exoplanet_search.phase1c import _stored_phase1c_config, run_phase1c_synthetic_validation, synthetic_dataset
 from exoplanet_search.phase1c_sampler import (
     THREAD_LIMIT_ENV_VARS,
+    canonical_sampler_move_configuration,
     checkpoint_metadata,
     execution_provenance,
     immutable_checkpoint_identity,
@@ -29,6 +30,12 @@ def test_config_and_cli_accept_and_reject_ensemble_processes(tmp_path):
 
     args = build_parser().parse_args(["--phase1c-synthetic-validation", "--phase1c-ensemble-processes", "4"])
     assert args.phase1c_ensemble_processes == 4
+    args = build_parser().parse_args(
+        ["--phase1c-synthetic-validation", "--phase1c-sampler-move-strategy", "de_snooker_v1"]
+    )
+    assert args.phase1c_sampler_move_strategy == "de_snooker_v1"
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["--phase1c-synthetic-validation", "--phase1c-sampler-move-strategy", "bad"])
 
     for value in (0, -1, True, 1.5):
         with pytest.raises(ValueError):
@@ -230,12 +237,18 @@ def test_parallel_provenance_records_spawn_processes_and_thread_policy(tmp_path)
 
     runtime = json.loads((run_dir / "sampler_runtime.json").read_text(encoding="utf-8"))
     provenance = json.loads((run_dir / "provenance_manifest.json").read_text(encoding="utf-8"))
+    saved_config = json.loads((run_dir / "phase1c_configuration.json").read_text(encoding="utf-8"))
     history = json.loads((run_dir / "invocation_history.json").read_text(encoding="utf-8"))["invocations"]
+    expected_move = canonical_sampler_move_configuration("stretch_v1")
 
     execution = runtime["execution_parallelism"]
     assert execution["requested_ensemble_processes"] == 2
     assert execution["effective_ensemble_processes"] == 2
     assert execution["execution_mode"] == "process_parallel"
+    assert execution["sampler_move_configuration"] == expected_move
+    assert runtime["sampler_move_configuration"] == expected_move
+    assert saved_config["sampler_move_configuration"] == expected_move
+    assert provenance["sampler_move_configuration"] == expected_move
     assert execution["multiprocessing_start_method"] == "spawn"
     assert execution["thread_limit_active_enforcement"] is True
     assert set(execution["thread_limit_environment"].values()) == {"1"}
@@ -306,6 +319,7 @@ def _parallel_test_config(output_dir, **overrides) -> Phase1CConfig:
         "prior_informed_max_pool_size": 16,
         "prior_informed_elite_size": 1,
         "prior_informed_min_finite_candidates": 1,
+        "maximum_initial_logp_deficit": 1.0e9,
         "prior_informed_max_logp_deficit": 1.0e9,
     }
     values.update(overrides)

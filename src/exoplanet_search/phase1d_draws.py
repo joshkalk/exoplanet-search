@@ -227,6 +227,7 @@ def load_phase1c_config(run_dir: Path) -> Phase1CConfig:
     payload = _read_json(run_dir / "phase1c_configuration.json")
     payload.pop("parameter_order", None)
     payload.pop("notes", None)
+    payload.pop("sampler_move_configuration", None)
     for key in ("phase1b_output_dir", "output_dir"):
         if key in payload:
             payload[key] = Path(payload[key])
@@ -244,6 +245,11 @@ def load_phase1c_config(run_dir: Path) -> Phase1CConfig:
     if "prior_informed_cloud_logp_drop" in payload:
         payload.setdefault("prior_informed_max_logp_deficit", payload["prior_informed_cloud_logp_drop"])
         payload.pop("prior_informed_cloud_logp_drop", None)
+    if "maximum_initial_logp_deficit" not in payload and "prior_informed_max_logp_deficit" in payload:
+        payload["maximum_initial_logp_deficit"] = payload["prior_informed_max_logp_deficit"]
+    if "prior_informed_max_logp_deficit" not in payload and "maximum_initial_logp_deficit" in payload:
+        payload["prior_informed_max_logp_deficit"] = payload["maximum_initial_logp_deficit"]
+    payload.setdefault("sampler_move_strategy", "stretch_v1")
     config = Phase1CConfig(**payload)
     return type(config)(**{**config.__dict__, "output_dir": run_dir})
 
