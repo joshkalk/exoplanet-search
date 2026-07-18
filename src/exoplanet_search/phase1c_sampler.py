@@ -263,15 +263,33 @@ def _run_ensembles_process_parallel(
     if requested_processes > int(config.n_ensembles):
         raise ValueError("ensemble_processes cannot exceed n_ensembles.")
 
+    metadata = checkpoint_metadata(data, config, mode=mode)
+    if not resume:
+        _reject_existing_parallel_checkpoints(output_dir, config.n_ensembles)
+    global_start = time.perf_counter()
+    latest_results = [
+        _hydrate_existing_ensemble_result(output_dir, config, metadata, ensemble_index)
+        for ensemble_index in range(int(config.n_ensembles))
+    ]
+    iterations = _stored_backend_iterations(output_dir, config.n_ensembles)
+    remaining = max(int(steps) - min(iterations), 0)
+    if remaining <= 0:
+        return _ordered_completed_results(latest_results)
+
+    initialization_summaries = [
+        None if result is None else result.initialization_summary for result in latest_results
+    ]
+    profiler_summaries = [
+        {} if result is None else dict(result.profiler_summary) for result in latest_results
+    ]
+    runtime_seconds = [0.0 if result is None else float(result.runtime_seconds) for result in latest_results]
+    process_ids: list[set[int]] = [
+        set() if result is None else set(int(pid) for pid in result.process_ids)
+        for result in latest_results
+    ]
+
     previous_thread_env = _set_thread_limit_environment()
     context = multiprocessing.get_context("spawn")
-    global_start = time.perf_counter()
-    initialization_summaries: list[dict[str, Any] | None] = [None] * int(config.n_ensembles)
-    profiler_summaries: list[dict[str, Any]] = [{} for _ in range(int(config.n_ensembles))]
-    runtime_seconds = [0.0 for _ in range(int(config.n_ensembles))]
-    process_ids: list[set[int]] = [set() for _ in range(int(config.n_ensembles))]
-    latest_results: list[EnsembleRunResult | None] = [None] * int(config.n_ensembles)
-
     try:
         with concurrent.futures.ProcessPoolExecutor(
             max_workers=requested_processes,
@@ -352,6 +370,54 @@ def _run_ensembles_process_parallel(
         _restore_thread_limit_environment(previous_thread_env)
 
     return _ordered_completed_results(latest_results)
+
+
+def _reject_existing_parallel_checkpoints(output_dir: Path, n_ensembles: int) -> None:
+    existing = [
+        output_dir / f"ensemble_{index:02d}.h5"
+        for index in range(int(n_ensembles))
+        if (output_dir / f"ensemble_{index:02d}.h5").exists()
+    ]
+    if existing:
+        paths = ", ".join(str(path) for path in existing)
+        raise FileExistsError(f"Refusing fresh Phase 1C process-parallel run with existing checkpoints: {paths}")
+
+
+def _hydrate_existing_ensemble_result(
+    output_dir: Path,
+    config: Phase1CConfig,
+    metadata: dict[str, Any],
+    ensemble_index: int,
+) -> EnsembleRunResult | None:
+    backend_path = output_dir / f"ensemble_{ensemble_index:02d}.h5"
+    if not backend_path.exists():
+        return None
+    seed = int(config.random_seed + 1000 * ensemble_index)
+    strategy = initialization_strategy(ensemble_index, config.n_ensembles)
+    validate_checkpoint_metadata(backend_path, metadata, seed)
+    backend = emcee.backends.HDFBackend(str(backend_path), read_only=True)
+    iterations = int(backend.iteration)
+    if iterations <= 0:
+        return None
+    return EnsembleRunResult(
+        ensemble_index=int(ensemble_index),
+        seed=seed,
+        strategy=strategy,
+        backend_path=backend_path,
+        iterations=iterations,
+        runtime_seconds=0.0,
+        acceptance_fraction=_backend_acceptance_fraction(backend, iterations),
+        initialization_summary=_resume_initialization_summary(strategy, seed),
+        profiler_summary=PosteriorProfiler().summary(),
+        process_ids=(),
+    )
+
+
+def _backend_acceptance_fraction(backend: emcee.backends.HDFBackend, iterations: int) -> np.ndarray:
+    accepted = np.asarray(backend.accepted, dtype=float)
+    if iterations <= 0:
+        return np.zeros_like(accepted, dtype=float)
+    return accepted / float(iterations)
 
 
 def _run_ensemble_chunk_worker(task: dict[str, Any]) -> EnsembleRunResult:
@@ -504,6 +570,9 @@ def execution_provenance(config: Phase1CConfig, results: list[EnsembleRunResult]
     """Return execution-only process/thread metadata for runtime provenance."""
     requested = int(config.ensemble_processes)
     effective = min(requested, int(config.n_ensembles))
+    active_thread_enforcement = effective > 1
+    configured_thread_limits = {name: "1" for name in THREAD_LIMIT_ENV_VARS}
+    observed_thread_environment = {name: os.environ.get(name) for name in THREAD_LIMIT_ENV_VARS}
     worker_pids: dict[str, list[int]] = {}
     per_ensemble_runtime: dict[str, float] = {}
     if results is not None:
@@ -520,7 +589,12 @@ def execution_provenance(config: Phase1CConfig, results: list[EnsembleRunResult]
         "effective_ensemble_processes": effective,
         "execution_mode": "sequential" if effective == 1 else "process_parallel",
         "multiprocessing_start_method": None if effective == 1 else "spawn",
-        "thread_limit_environment": {name: "1" for name in THREAD_LIMIT_ENV_VARS},
+        "thread_limit_active_enforcement": active_thread_enforcement,
+        "thread_limit_environment": configured_thread_limits
+        if active_thread_enforcement
+        else observed_thread_environment,
+        "configured_thread_limit_environment": configured_thread_limits,
+        "observed_thread_environment": observed_thread_environment,
         "thread_limit_policy": (
             "Process-parallel Phase 1C workers inherit one-thread numerical-library limits "
             "and set the same limits again at worker entry."

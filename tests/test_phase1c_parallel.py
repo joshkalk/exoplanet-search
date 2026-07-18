@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import emcee
@@ -10,8 +11,11 @@ import pytest
 from exoplanet_search.cli import build_parser
 from exoplanet_search.phase1c import _stored_phase1c_config, run_phase1c_synthetic_validation, synthetic_dataset
 from exoplanet_search.phase1c_sampler import (
+    THREAD_LIMIT_ENV_VARS,
     checkpoint_metadata,
+    execution_provenance,
     immutable_checkpoint_identity,
+    _run_ensemble_chunk_worker,
     run_ensembles,
 )
 from exoplanet_search.phase1c_types import Phase1CConfig
@@ -96,6 +100,81 @@ def test_cross_mode_resume_matches_uninterrupted_chain_exactly(tmp_path):
         _assert_backend_equivalent(full_result.backend_path, resumed_result.backend_path)
 
 
+def test_process_parallel_resume_from_uneven_checkpoints_to_current_target(tmp_path):
+    reference = _run_synthetic_ensembles(tmp_path, "reference4", ensemble_processes=1, steps=4)
+    config, data, timing = _build_uneven_checkpoint_state(tmp_path, "uneven4")
+    complete_before = _backend_snapshot(config.output_dir / "ensemble_00.h5")
+    callbacks = []
+
+    resume_config = _parallel_test_config(tmp_path / "uneven4", ensemble_processes=2, chunk_steps=2)
+    results = run_ensembles(
+        data,
+        resume_config,
+        timing,
+        steps=4,
+        mode="synthetic",
+        resume=True,
+        chunk_callback=lambda chunk_results, _elapsed, _profiler: callbacks.append(chunk_results),
+    )
+
+    assert [result.ensemble_index for result in results] == [0, 1]
+    assert [result.iterations for result in results] == [4, 4]
+    assert len(callbacks) == 1
+    assert [result.ensemble_index for result in callbacks[0]] == [0, 1]
+    assert [result.iterations for result in callbacks[0]] == [4, 4]
+    assert results[0].process_ids == ()
+    assert results[0].profiler_summary["posterior_calls"] == 0
+    _assert_backend_matches_snapshot(config.output_dir / "ensemble_00.h5", complete_before)
+    for reference_result, resumed_result in zip(reference.results, results, strict=True):
+        _assert_backend_equivalent(reference_result.backend_path, resumed_result.backend_path)
+
+
+def test_process_parallel_resume_from_uneven_checkpoints_to_higher_target(tmp_path):
+    reference = _run_synthetic_ensembles(tmp_path, "reference6", ensemble_processes=1, steps=6)
+    config, data, timing = _build_uneven_checkpoint_state(tmp_path, "uneven6")
+    complete_before = _backend_snapshot(config.output_dir / "ensemble_00.h5")
+
+    resume_config = _parallel_test_config(tmp_path / "uneven6", ensemble_processes=2, chunk_steps=2)
+    results = run_ensembles(data, resume_config, timing, steps=6, mode="synthetic", resume=True)
+
+    assert [result.iterations for result in results] == [6, 6]
+    assert results[0].process_ids
+    assert results[0].profiler_summary["posterior_calls"] > 0
+    assert not np.array_equal(
+        complete_before["chain"],
+        emcee.backends.HDFBackend(str(config.output_dir / "ensemble_00.h5"), read_only=True).get_chain(),
+    )
+    for reference_result, resumed_result in zip(reference.results, results, strict=True):
+        _assert_backend_equivalent(reference_result.backend_path, resumed_result.backend_path)
+
+
+def test_process_parallel_noop_resume_hydrates_without_sampling_or_callback(tmp_path):
+    complete = _run_synthetic_ensembles(tmp_path, "complete", ensemble_processes=1, steps=4)
+    snapshots = [_backend_snapshot(result.backend_path) for result in complete.results]
+    callbacks = []
+
+    resume_config = _parallel_test_config(tmp_path / "complete", ensemble_processes=2, chunk_steps=2)
+    data, timing, _ = synthetic_dataset(resume_config)
+    results = run_ensembles(
+        data,
+        resume_config,
+        timing,
+        steps=4,
+        mode="synthetic",
+        resume=True,
+        chunk_callback=lambda chunk_results, _elapsed, _profiler: callbacks.append(chunk_results),
+    )
+
+    assert [result.ensemble_index for result in results] == [0, 1]
+    assert [result.iterations for result in results] == [4, 4]
+    assert callbacks == []
+    for result, snapshot in zip(results, snapshots, strict=True):
+        assert result.process_ids == ()
+        assert result.runtime_seconds == 0.0
+        assert result.profiler_summary["posterior_calls"] == 0
+        _assert_backend_matches_snapshot(result.backend_path, snapshot)
+
+
 def test_parallel_chunk_callbacks_are_global_barriers_and_ordered(tmp_path):
     run = _run_synthetic_ensembles(tmp_path, "callbacks", ensemble_processes=2, steps=6)
 
@@ -105,19 +184,21 @@ def test_parallel_chunk_callbacks_are_global_barriers_and_ordered(tmp_path):
         assert iterations == [2 * callback_index, 2 * callback_index]
 
 
-def test_parallel_worker_failure_is_reported_and_stops_later_chunks(tmp_path):
-    config = _parallel_test_config(tmp_path / "failure", ensemble_processes=2, chunk_steps=2)
-    data, timing, _ = synthetic_dataset(config)
+def test_parallel_worker_failure_can_resume_preserved_uneven_checkpoints(tmp_path):
+    reference = _run_synthetic_ensembles(tmp_path, "failure_reference4", ensemble_processes=1, steps=4)
+    config, data, timing = _build_uneven_checkpoint_state(tmp_path, "failure")
+    complete_before = _backend_snapshot(config.output_dir / "ensemble_00.h5")
     callbacks = []
 
+    resume_config = _parallel_test_config(tmp_path / "failure", ensemble_processes=2, chunk_steps=2)
     with pytest.raises(RuntimeError) as excinfo:
         run_ensembles(
             data,
-            config,
+            resume_config,
             timing,
             steps=4,
             mode="synthetic",
-            resume=False,
+            resume=True,
             chunk_callback=lambda results, _elapsed, _profiler: callbacks.append(results),
             _failure_injection={"ensemble_index": 1, "message": "controlled failure"},
         )
@@ -129,7 +210,11 @@ def test_parallel_worker_failure_is_reported_and_stops_later_chunks(tmp_path):
     assert "backend_path=" in message
     assert "requested_chunk=2" in message
     assert callbacks == []
-    assert (config.output_dir / "ensemble_00.h5").exists()
+    _assert_backend_matches_snapshot(config.output_dir / "ensemble_00.h5", complete_before)
+
+    recovered = run_ensembles(data, resume_config, timing, steps=4, mode="synthetic", resume=True)
+    for reference_result, recovered_result in zip(reference.results, recovered, strict=True):
+        _assert_backend_equivalent(reference_result.backend_path, recovered_result.backend_path)
 
 
 def test_parallel_provenance_records_spawn_processes_and_thread_policy(tmp_path):
@@ -152,7 +237,9 @@ def test_parallel_provenance_records_spawn_processes_and_thread_policy(tmp_path)
     assert execution["effective_ensemble_processes"] == 2
     assert execution["execution_mode"] == "process_parallel"
     assert execution["multiprocessing_start_method"] == "spawn"
+    assert execution["thread_limit_active_enforcement"] is True
     assert set(execution["thread_limit_environment"].values()) == {"1"}
+    assert set(execution["configured_thread_limit_environment"].values()) == {"1"}
     assert execution["worker_process_ids"]
     assert runtime["latest_invocation"]["mutable_execution_controls"]["ensemble_processes"] == 2
     assert history[-1]["mutable_execution_controls"]["ensemble_processes"] == 2
@@ -160,6 +247,20 @@ def test_parallel_provenance_records_spawn_processes_and_thread_policy(tmp_path)
     data, _, _ = synthetic_dataset(config)
     metadata = checkpoint_metadata(data, config, mode="synthetic")
     assert "ensemble_processes" not in metadata["immutable_scientific_identity"]["priors_and_transforms"]["configuration"]
+
+
+def test_sequential_execution_provenance_reports_inherited_thread_environment(monkeypatch):
+    for name in THREAD_LIMIT_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("OPENBLAS_NUM_THREADS", "3")
+
+    execution = execution_provenance(Phase1CConfig(n_ensembles=2, ensemble_processes=1))
+
+    assert execution["execution_mode"] == "sequential"
+    assert execution["thread_limit_active_enforcement"] is False
+    assert execution["thread_limit_environment"]["OPENBLAS_NUM_THREADS"] == "3"
+    assert execution["thread_limit_environment"]["OMP_NUM_THREADS"] is None
+    assert set(execution["configured_thread_limit_environment"].values()) == {"1"}
 
 
 class _SyntheticRun:
@@ -211,6 +312,48 @@ def _parallel_test_config(output_dir, **overrides) -> Phase1CConfig:
     return Phase1CConfig(**values)
 
 
+def _build_uneven_checkpoint_state(tmp_path, name: str):
+    config = _parallel_test_config(tmp_path / name, ensemble_processes=1, chunk_steps=2)
+    data, timing, _ = synthetic_dataset(config)
+    run_ensembles(data, config, timing, steps=2, mode="synthetic", resume=False)
+    _advance_single_ensemble(data, config, timing, ensemble_index=0, target_steps=4, chunk_steps=2)
+    assert emcee.backends.HDFBackend(str(config.output_dir / "ensemble_00.h5"), read_only=True).iteration == 4
+    assert emcee.backends.HDFBackend(str(config.output_dir / "ensemble_01.h5"), read_only=True).iteration == 2
+    return config, data, timing
+
+
+def _advance_single_ensemble(
+    data,
+    config: Phase1CConfig,
+    timing,
+    *,
+    ensemble_index: int,
+    target_steps: int,
+    chunk_steps: int,
+) -> None:
+    previous = {name: os.environ.get(name) for name in THREAD_LIMIT_ENV_VARS}
+    try:
+        _run_ensemble_chunk_worker(
+            {
+                "data": data,
+                "config": config,
+                "timing": timing,
+                "mode": "synthetic",
+                "resume": True,
+                "ensemble_index": ensemble_index,
+                "target_steps": target_steps,
+                "chunk_steps": chunk_steps,
+                "failure_injection": None,
+            }
+        )
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 def _assert_result_equivalent(left, right) -> None:
     assert left.ensemble_index == right.ensemble_index
     assert left.seed == right.seed
@@ -243,6 +386,30 @@ def _assert_backend_equivalent(left_path: Path, right_path: Path) -> None:
             "phase1c_ensemble_seed",
         ):
             assert left_hdf.attrs[key] == right_hdf.attrs[key]
+
+
+def _backend_snapshot(path: Path) -> dict:
+    backend = emcee.backends.HDFBackend(str(path), read_only=True)
+    return {
+        "iteration": int(backend.iteration),
+        "chain": backend.get_chain().copy(),
+        "log_prob": backend.get_log_prob().copy(),
+        "accepted": np.asarray(backend.accepted).copy(),
+        "coords": backend.get_last_sample().coords.copy(),
+        "last_log_prob": backend.get_last_sample().log_prob.copy(),
+        "random_state": backend.random_state,
+    }
+
+
+def _assert_backend_matches_snapshot(path: Path, snapshot: dict) -> None:
+    backend = emcee.backends.HDFBackend(str(path), read_only=True)
+    assert int(backend.iteration) == snapshot["iteration"]
+    assert np.array_equal(backend.get_chain(), snapshot["chain"])
+    assert np.array_equal(backend.get_log_prob(), snapshot["log_prob"])
+    assert np.array_equal(backend.accepted, snapshot["accepted"])
+    assert np.array_equal(backend.get_last_sample().coords, snapshot["coords"])
+    assert np.array_equal(backend.get_last_sample().log_prob, snapshot["last_log_prob"])
+    _assert_random_states_equal(backend.random_state, snapshot["random_state"])
 
 
 def _assert_random_states_equal(left, right) -> None:
