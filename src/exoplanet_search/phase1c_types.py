@@ -20,6 +20,9 @@ PARAMETER_ORDER = (
     "mid_epoch_offset",
 )
 
+DIAGNOSTIC_METHODOLOGY_VERSION = "phase1c_emcee_ensemble_state_v2"
+SAMPLER_MOVE_STRATEGIES = ("stretch_v1", "de_snooker_v1")
+
 
 @dataclass(frozen=True)
 class Phase1CConfig:
@@ -30,6 +33,7 @@ class Phase1CConfig:
     run_id: str | None = None
     random_seed: int = 20260715
     n_ensembles: int = 4
+    ensemble_processes: int = 1
     n_walkers: int = 24
     pilot_steps: int = 24
     synthetic_steps: int = 80
@@ -39,6 +43,7 @@ class Phase1CConfig:
     additional_steps: int | None = None
     chunk_steps: int = 12
     warmup_steps: int = 8
+    sampler_move_strategy: str = "stretch_v1"
     supersample_factor: int = 11
     rp_bounds: tuple[float, float] = (0.001, 0.35)
     a_bounds: tuple[float, float] = (1.01, 100.0)
@@ -57,11 +62,99 @@ class Phase1CConfig:
     convergence_stability_sigma_threshold: float = 0.25
     convergence_ensemble_shift_threshold: float = 3.0
     convergence_interval_overlap_minimum: float = 0.25
+    convergence_tail_interval_overlap_minimum: float = 0.25
+    convergence_ensemble_scale_ratio_max: float = 3.0
+    autocorrelation_min_usable_walkers: int = 2
     max_pilot_seconds: float = 600.0
     minimum_meaningful_summary_draws: int = 1000
+    diagnostic_methodology_version: str = DIAGNOSTIC_METHODOLOGY_VERSION
+    prior_informed_pool_size: int = 1024
+    prior_informed_max_pool_size: int = 8192
+    prior_informed_pool_growth_factor: int = 2
+    prior_informed_pool_scale_multiplier: float = 0.8
+    prior_informed_elite_size: int = 16
+    prior_informed_min_finite_candidates: int = 8
+    maximum_initial_logp_deficit: float = 30.0
+    prior_informed_max_logp_deficit: float = 30.0
     local_tight_scales: tuple[float, ...] = (0.015, 0.02, 0.015, 0.015, 0.015, 0.05, 1.0e-5, 2.0e-4)
     local_moderate_scales: tuple[float, ...] = (0.04, 0.05, 0.04, 0.04, 0.04, 0.12, 5.0e-5, 1.0e-3)
     local_broad_scales: tuple[float, ...] = (0.08, 0.10, 0.08, 0.08, 0.08, 0.25, 2.0e-4, 5.0e-3)
+    prior_informed_cloud_scales: tuple[float, ...] = (
+        0.06,
+        0.075,
+        0.06,
+        0.06,
+        0.06,
+        0.18,
+        1.0e-4,
+        2.0e-3,
+    )
+    severe_walker_acceptance_max: float = 0.05
+    severe_walker_repeated_fraction_min: float = 0.95
+    severe_walker_logp_deficit_min: float = 100.0
+    severe_walker_final_distance_min: float = 25.0
+
+    def __post_init__(self) -> None:
+        if self.diagnostic_methodology_version != DIAGNOSTIC_METHODOLOGY_VERSION:
+            raise ValueError(
+                "diagnostic_methodology_version must equal "
+                f"{DIAGNOSTIC_METHODOLOGY_VERSION!r}."
+            )
+        if str(self.sampler_move_strategy) not in SAMPLER_MOVE_STRATEGIES:
+            raise ValueError(f"sampler_move_strategy must be one of {SAMPLER_MOVE_STRATEGIES}.")
+        if int(self.autocorrelation_min_usable_walkers) < 2:
+            raise ValueError("autocorrelation_min_usable_walkers must be at least 2.")
+        ensemble_processes = _require_integer(self.ensemble_processes, "ensemble_processes")
+        if ensemble_processes <= 0:
+            raise ValueError("ensemble_processes must be positive.")
+        if ensemble_processes > int(self.n_ensembles):
+            raise ValueError("ensemble_processes cannot exceed n_ensembles.")
+        initial_pool_size = _require_integer(self.prior_informed_pool_size, "prior_informed_pool_size")
+        max_pool_size = _require_integer(
+            self.prior_informed_max_pool_size,
+            "prior_informed_max_pool_size",
+        )
+        growth_factor = _require_integer(
+            self.prior_informed_pool_growth_factor,
+            "prior_informed_pool_growth_factor",
+        )
+        required_candidates = _require_integer(
+            self.prior_informed_min_finite_candidates,
+            "prior_informed_min_finite_candidates",
+        )
+        elite_size = _require_integer(self.prior_informed_elite_size, "prior_informed_elite_size")
+        if initial_pool_size <= 0:
+            raise ValueError("prior_informed_pool_size must be positive.")
+        if max_pool_size < initial_pool_size:
+            raise ValueError("prior_informed_max_pool_size must be at least prior_informed_pool_size.")
+        if growth_factor < 2:
+            raise ValueError("prior_informed_pool_growth_factor must be an integer at least 2.")
+        if required_candidates <= 0:
+            raise ValueError("prior_informed_min_finite_candidates must be positive.")
+        if elite_size <= 0:
+            raise ValueError("prior_informed_elite_size must be positive.")
+        if float(self.prior_informed_pool_scale_multiplier) <= 0.0:
+            raise ValueError("prior_informed_pool_scale_multiplier must be positive.")
+        if (
+            not np.isfinite(float(self.maximum_initial_logp_deficit))
+            or float(self.maximum_initial_logp_deficit) <= 0.0
+        ):
+            raise ValueError("maximum_initial_logp_deficit must be finite and positive.")
+        if not np.isclose(
+            float(self.prior_informed_max_logp_deficit),
+            float(self.maximum_initial_logp_deficit),
+            rtol=0.0,
+            atol=0.0,
+        ):
+            raise ValueError(
+                "prior_informed_max_logp_deficit must exactly match maximum_initial_logp_deficit; "
+                "use maximum_initial_logp_deficit as the authoritative setting."
+            )
+        if (
+            not np.isfinite(float(self.prior_informed_max_logp_deficit))
+            or float(self.prior_informed_max_logp_deficit) <= 0.0
+        ):
+            raise ValueError("prior_informed_max_logp_deficit must be finite and positive.")
 
     def to_dict(self) -> dict[str, Any]:
         values = asdict(self)
@@ -77,8 +170,33 @@ class Phase1CConfig:
             "jitter_prior": "Half-normal in physical jitter; sampled in log jitter with Jacobian.",
             "baseline_marginalization": "Exact Gaussian marginalization per event.",
             "pilot_label": "PILOT - NONPRODUCTION - NONCONVERGED",
+            "diagnostic_methodology": DIAGNOSTIC_METHODOLOGY_VERSION,
+            "prior_informed_initialization": (
+                "Broad prior pool is posterior-screened to select one remote anchor, then walkers "
+                "start as a coherent local cloud around that anchor."
+            ),
+            "sampler_move_strategy": (
+                "Explicit emcee move strategy; legacy configurations without this field are interpreted "
+                "as stretch_v1."
+            ),
+            "initialization_screening": (
+                "Every fresh walker must be finite and within maximum_initial_logp_deficit of the "
+                "deterministic Phase 1B-derived center; injected synthetic truth is not used."
+            ),
         }
         return values
+
+
+def _require_integer(value: Any, field_name: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be an integer.")
+    try:
+        integer = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be an integer.") from exc
+    if integer != value:
+        raise ValueError(f"{field_name} must be an integer.")
+    return integer
 
 
 @dataclass(frozen=True)

@@ -274,6 +274,21 @@ real-data pilot. Posterior predictive checks, Student's-t reweighting,
 supersampling-21 reweighting, broader limb-darkening sensitivity checks, and
 fixed-limb-darkening posterior runs remain pending.
 
+The sampler move strategy is explicit and checkpointed so resumed runs cannot
+silently change kernels. `stretch_v1` is the legacy single
+`emcee.moves.StretchMove(a=2.0)` strategy; `de_snooker_v1` is the redesigned
+mixture of `emcee.moves.DEMove()` at weight 0.8 and
+`emcee.moves.DESnookerMove()` at weight 0.2. Fresh initialization keeps the
+four deterministic ensemble strategies (`local_tight`, `local_moderate`,
+`local_broad`, `prior_informed`) but screens every proposed walker through the
+production posterior path, requiring a finite log posterior within the
+configured center-relative deficit without using injected synthetic truth. This
+screen is only an initialization quality gate, not posterior sampling; warmup
+draws are still discarded, and no walker repair, relocation, deletion, or
+adaptive move-weight change is permitted after sampling begins. A future
+realistic recovery should pass a cheap early health precursor before a full
+recovery run is launched.
+
 Validate the frozen Phase 1B inputs and write checksums. Each Phase 1C
 invocation writes to an isolated run directory under the configured output
 base; pass `--phase1c-run-id` for a deterministic directory name:
@@ -323,3 +338,74 @@ summaries, and basic trace/marginal/correlation plots when enough samples are
 available. Existing run directories are not overwritten unless resuming that
 specific run. The Phase 1B accepted cadences remain frozen and checksummed;
 Phase 1C rejects confirmed input mismatches rather than modifying that snapshot.
+
+## Phase 1D: posterior-predictive foundation
+
+Phase 1D starts from existing Phase 1C checkpoints. The first implementation
+pass adds reusable, ensemble-aware posterior draw access and development-only
+posterior-predictive flux generation. A validated source object binds the
+Phase 1C run directory, saved configuration, mode, frozen or reconstructed
+data, derived timing reference, HDF ensembles, diagnostics, checkpoint
+metadata, input provenance, and any declared source requirements before draw
+selection or predictive generation. Public predictive entry points consume the
+validated source directly, so callers do not supply an independent timing
+reference, data table, or configuration. It preserves the originating run ID,
+mode, selection position, ensemble, walker, and stored HDF step for every
+selected draw; the draw subset is a posterior-predictive Monte Carlo subset,
+not posterior thinning.
+
+For each selected vector, Phase 1D reuses the Phase 1C transformations,
+BATMAN transit model, event-local coordinate, checkpoint metadata validation,
+and exact Gaussian marginalized event likelihood. The full exposure-integrated
+transit model is evaluated once per posterior-predictive replicate and sliced
+by event for conditional-baseline draws. The local multiplicative baseline design is
+`X = [m, m*x]`, where `m` is the exposure-integrated transit model and `x` is
+the deterministic event-local coordinate. Conditional baseline coefficients are
+drawn from:
+
+```text
+beta | y, theta ~ Normal(baseline_mean, baseline_covariance)
+```
+
+Replicated flux is generated at the frozen accepted cadences as:
+
+```text
+y_rep = X beta_draw + Normal(0, sigma_i^2 + jitter^2)
+```
+
+The covariance is sampled by Cholesky factorization after checking shape,
+finiteness, symmetry, and positive definiteness. The predictive noise is newly
+generated from cadence uncertainty and sampled jitter; observed residuals are
+not resampled. Ensemble provenance is retained so later predictive checks can
+audit whether behavior is concentrated in one independent ensemble or shared
+across the posterior.
+
+Authoritative primary-source loading requires an explicit requirements record
+for the intended primary posterior, including the expected run ID, production
+mode, four ensembles, 32 walkers, 2000 warmup steps, supersampling factor 11,
+limb-darkening sigma floor 0.08, convergence thresholds, and the eight
+transformed-parameter order. It also verifies the complete Phase 1C convergence
+criteria, finite log-probability fraction, final convergence-history row,
+checkpoint iteration counts, stability, ensemble agreement, and
+autocorrelation criteria before allowing authoritative draw selection.
+
+A bounded development mode can exercise this plumbing against a small existing
+Phase 1C run. Its outputs are labeled nonauthoritative and must not be used as
+the scientific Phase 1D posterior-predictive analysis. Development execution is
+capped at 1 to 10 selected draws:
+
+```bash
+python -m exoplanet_search.cli --phase1d-development-predictive \
+  --phase1d-source-run-dir data/interim/kepler5_phase1c_posterior/synthetic-demo \
+  --phase1d-run-id dev-demo --phase1d-n-draws 2
+```
+
+Development outputs include a draw-selection manifest, selected-draw audit,
+event-baseline draw audit, predictive configuration, and a compressed NPZ file
+with cadence-aligned replicated flux arrays. The NPZ and JSONL audit rows carry
+source run ID, source mode, selection position, predictive replication index,
+ensemble, walker, and stored step so every replicated cadence and event
+baseline can be traced back to its selected posterior draw. The selection
+manifest records requirement expected/observed values when present, input
+identity, checkpoint iterations, diagnostics status, available source Git
+state, and authoritative or override status.

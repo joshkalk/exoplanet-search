@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from .config import (
+    DATA_INTERIM_DIR,
     DATA_RAW_DIR,
     DEFAULT_AUTHOR,
     DEFAULT_CADENCE,
@@ -46,6 +47,7 @@ from .phase1c import (
     validate_phase1c_inputs,
 )
 from .phase1c_types import Phase1CConfig
+from .phase1d import Phase1DDevelopmentConfig, run_phase1d_development_predictive
 from .preprocessing import PREPROCESSING_MODES, PreprocessingConfig, preprocess_light_curve
 from .provenance import build_provenance_manifest, write_json
 from .recovery import (
@@ -54,6 +56,18 @@ from .recovery import (
     save_folded_transit_plot,
     save_windowed_transit_plot,
 )
+
+
+def _positive_integer_argument(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if str(parsed) != value.strip():
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -237,6 +251,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--phase1c-random-seed", type=int, default=20260715)
     parser.add_argument("--phase1c-run-id", default=None, help="Deterministic Phase 1C run ID for isolated outputs.")
     parser.add_argument("--phase1c-n-ensembles", type=int, default=4)
+    parser.add_argument("--phase1c-ensemble-processes", type=_positive_integer_argument, default=1)
     parser.add_argument("--phase1c-n-walkers", type=int, default=24)
     parser.add_argument("--phase1c-pilot-steps", type=int, default=24)
     parser.add_argument("--phase1c-synthetic-steps", type=int, default=80)
@@ -247,10 +262,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--phase1c-chunk-steps", type=int, default=12)
     parser.add_argument("--phase1c-warmup-steps", type=int, default=8)
     parser.add_argument(
+        "--phase1c-sampler-move-strategy",
+        choices=("stretch_v1", "de_snooker_v1"),
+        default="stretch_v1",
+        help="Explicit emcee move strategy for Phase 1C sampling.",
+    )
+    parser.add_argument("--phase1c-maximum-initial-logp-deficit", type=float, default=30.0)
+    parser.add_argument("--phase1c-prior-informed-max-pool-size", type=int, default=8192)
+    parser.add_argument("--phase1c-prior-informed-pool-growth-factor", type=int, default=2)
+    parser.add_argument(
         "--phase1c-summarize-mode",
         choices=("pilot", "production", "synthetic", "synthetic_recovery"),
         default="pilot",
     )
+    parser.add_argument(
+        "--phase1d-development-predictive",
+        action="store_true",
+        help="Run a tiny nonauthoritative Phase 1D posterior-predictive development check.",
+    )
+    parser.add_argument("--phase1d-source-run-dir", type=Path, default=None)
+    parser.add_argument("--phase1d-output-dir", type=Path, default=DATA_INTERIM_DIR / "kepler5_phase1d")
+    parser.add_argument("--phase1d-run-id", default=None)
+    parser.add_argument("--phase1d-n-draws", type=int, default=2)
+    parser.add_argument("--phase1d-selection-seed", type=int, default=2026071701)
+    parser.add_argument("--phase1d-predictive-seed", type=int, default=2026071702)
     return parser
 
 
@@ -260,6 +295,9 @@ def main() -> None:
 
     if _phase1c_requested(args):
         _run_phase1c_from_args(args)
+        return
+    if args.phase1d_development_predictive:
+        _run_phase1d_from_args(args)
         return
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -566,6 +604,7 @@ def _phase1c_config_from_args(args) -> Phase1CConfig:
         run_id=args.phase1c_run_id,
         random_seed=args.phase1c_random_seed,
         n_ensembles=args.phase1c_n_ensembles,
+        ensemble_processes=args.phase1c_ensemble_processes,
         n_walkers=args.phase1c_n_walkers,
         pilot_steps=args.phase1c_pilot_steps,
         synthetic_steps=args.phase1c_synthetic_steps,
@@ -575,6 +614,11 @@ def _phase1c_config_from_args(args) -> Phase1CConfig:
         additional_steps=args.phase1c_additional_steps,
         chunk_steps=args.phase1c_chunk_steps,
         warmup_steps=args.phase1c_warmup_steps,
+        sampler_move_strategy=args.phase1c_sampler_move_strategy,
+        maximum_initial_logp_deficit=args.phase1c_maximum_initial_logp_deficit,
+        prior_informed_max_logp_deficit=args.phase1c_maximum_initial_logp_deficit,
+        prior_informed_max_pool_size=args.phase1c_prior_informed_max_pool_size,
+        prior_informed_pool_growth_factor=args.phase1c_prior_informed_pool_growth_factor,
     )
 
 
@@ -610,6 +654,25 @@ def _run_phase1c_from_args(args) -> None:
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         raise SystemExit(f"Phase 1C {requested[0]} failed: {exc}") from exc
     print(f"Wrote Phase 1C {requested[0]} outputs under: {config.output_dir}")
+    print(json.dumps(result, indent=2))
+
+
+def _run_phase1d_from_args(args) -> None:
+    if args.phase1d_source_run_dir is None:
+        raise SystemExit("--phase1d-development-predictive requires --phase1d-source-run-dir.")
+    config = Phase1DDevelopmentConfig(
+        source_run_dir=args.phase1d_source_run_dir,
+        output_dir=args.phase1d_output_dir,
+        run_id=args.phase1d_run_id,
+        n_draws=args.phase1d_n_draws,
+        selection_seed=args.phase1d_selection_seed,
+        predictive_seed=args.phase1d_predictive_seed,
+    )
+    try:
+        result = run_phase1d_development_predictive(config)
+    except (FileNotFoundError, FileExistsError, ValueError, RuntimeError) as exc:
+        raise SystemExit(f"Phase 1D development predictive failed: {exc}") from exc
+    print(f"Wrote Phase 1D development predictive outputs under: {config.output_dir}")
     print(json.dumps(result, indent=2))
 
 
