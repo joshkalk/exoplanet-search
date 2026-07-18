@@ -1069,6 +1069,7 @@ def immutable_checkpoint_identity(
     return {
         "mode": mode,
         "phase1b_input_manifest_sha256": data.input_manifest["manifest_sha256"],
+        "synthetic_dataset_identity": data.input_manifest.get("synthetic_dataset_identity"),
         "model": {
             "transit": "batman circular one-planet quadratic limb-darkening",
             "likelihood": "Gaussian cadence noise with exact Gaussian local-baseline marginalization",

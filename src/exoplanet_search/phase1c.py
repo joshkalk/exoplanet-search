@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import re
 import json
+import re
 import subprocess
 import time
 from dataclasses import replace
@@ -14,7 +14,6 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .phase1b_model import batman_flux
 from .phase1c_diagnostics import (
     convergence_diagnostics,
     ensemble_summary_frame,
@@ -25,11 +24,9 @@ from .phase1c_diagnostics import (
     posterior_summary_frame,
 )
 from .phase1c_inputs import load_frozen_phase1b, write_phase1b_input_manifest
-from .phase1c_likelihood import log_probability
 from .phase1c_outputs import write_correlation_plot, write_json, write_marginal_plot, write_trace_plot
 from .phase1c_parameters import (
     build_timing_reference,
-    physical_to_vector,
     prior_description,
     timing_support_audit,
 )
@@ -42,7 +39,19 @@ from .phase1c_sampler import (
     load_backend_chains_by_ensemble,
     run_ensembles,
 )
-from .phase1c_types import FrozenPhase1BData, Phase1CConfig, PhysicalSample, TimingReference
+from .phase1c_synthetic import (
+    LEGACY_TOY_DATASET_DESIGN,
+    REALISTIC_DATASET_DESIGN,
+    RECOVERY_PARAMETER_REGISTRY,
+    SyntheticDatasetResult,
+    build_synthetic_dataset_for_mode,
+    build_toy_synthetic_dataset,
+    canonical_array_hash,
+    synthetic_input_record,
+    synthetic_input_record_from_data,
+    validate_synthetic_input_record,
+)
+from .phase1c_types import FrozenPhase1BData, Phase1CConfig, TimingReference
 
 PILOT_LABEL = "PILOT - NONPRODUCTION - NONCONVERGED"
 
@@ -112,11 +121,19 @@ def run_phase1c_synthetic_validation(
     """Run a reproducible synthetic Phase 1C smoke or recovery validation."""
     mode = "synthetic_recovery" if recovery else "synthetic"
     run_config = prepare_run_config(config, mode, resume=resume)
-    data, timing, injected = synthetic_dataset(run_config)
+    synthetic_result = build_synthetic_dataset_for_mode(run_config, mode)
     default_steps = run_config.synthetic_recovery_steps if recovery else run_config.synthetic_steps
     steps = _target_steps(run_config, default_steps, resume=resume)
-    result = _run_sampling_mode(data, run_config, timing, mode=mode, steps=steps, resume=resume)
-    payload = _synthetic_summary(run_config, timing, injected, result, recovery=recovery)
+    result = _run_sampling_mode(
+        synthetic_result.data,
+        run_config,
+        synthetic_result.timing,
+        mode=mode,
+        steps=steps,
+        resume=resume,
+        synthetic_result=synthetic_result,
+    )
+    payload = _synthetic_summary(run_config, synthetic_result, result, recovery=recovery)
     write_json(run_config.output_dir / "synthetic_recovery_summary.json", payload)
     return payload
 
@@ -404,10 +421,32 @@ def _write_json_if_absent(path: Path, payload: dict[str, Any]) -> None:
         write_json(path, payload)
 
 
+def _read_synthetic_input_record_if_exists(output_dir: Path) -> dict[str, Any] | None:
+    path = output_dir / "synthetic_input_record.json"
+    if not path.exists():
+        return None
+    return _read_json(path)
+
+
+def _write_synthetic_dataset_artifacts(
+    config: Phase1CConfig,
+    result: SyntheticDatasetResult,
+    *,
+    immutable: bool,
+) -> None:
+    if result.baseline_coefficients_csv is None:
+        return
+    path = config.output_dir / "synthetic_baseline_coefficients.csv"
+    if immutable and path.exists():
+        return
+    path.write_text(result.baseline_coefficients_csv, encoding="utf-8")
+
+
 def _load_summarize_data(config: Phase1CConfig, mode: str) -> tuple[FrozenPhase1BData, TimingReference]:
     if mode in {"synthetic", "synthetic_recovery"}:
-        data, timing, _ = synthetic_dataset(config)
-        return data, timing
+        record = _read_synthetic_input_record_if_exists(config.output_dir)
+        result = build_synthetic_dataset_for_mode(config, mode, recorded_input=record)
+        return result.data, result.timing
     data = load_frozen_phase1b(config)
     return data, build_timing_reference(data, config)
 
@@ -424,17 +463,8 @@ def _validate_synthetic_input_record_if_needed(
     if not path.exists():
         raise FileNotFoundError(f"Missing synthetic input record: {path}")
     recorded = _read_json(path)
-    expected = _synthetic_input_record(data, timing)
-    for key in ("type", "cadence_count", "event_count", "residuals_csv_used_as_input"):
-        if recorded.get(key) != expected[key]:
-            raise ValueError(f"synthetic_input_record.json mismatch for {key}.")
-    for key, value in expected["timing_reference"].items():
-        recorded_value = recorded.get("timing_reference", {}).get(key)
-        if isinstance(value, float):
-            if not np.isclose(float(recorded_value), value, rtol=0.0, atol=1.0e-12):
-                raise ValueError(f"synthetic_input_record.json timing mismatch for {key}.")
-        elif recorded_value != value:
-            raise ValueError(f"synthetic_input_record.json timing mismatch for {key}.")
+    expected = synthetic_input_record_from_data(data, timing)
+    validate_synthetic_input_record(recorded, expected)
 
 
 def _run_sampling_mode(
@@ -445,6 +475,7 @@ def _run_sampling_mode(
     mode: str,
     steps: int,
     resume: bool,
+    synthetic_result: SyntheticDatasetResult | None = None,
 ) -> dict[str, Any]:
     start = time.perf_counter()
     starting_iterations = _stored_iterations(config.output_dir)
@@ -459,7 +490,12 @@ def _run_sampling_mode(
                 write_phase1b_input_manifest(config.phase1b_output_dir, config.output_dir)
         else:
             writer = _write_json_if_absent if resume else write_json
-            writer(config.output_dir / "synthetic_input_record.json", _synthetic_input_record(data, timing))
+            if synthetic_result is not None:
+                _write_synthetic_dataset_artifacts(config, synthetic_result, immutable=resume)
+                record = synthetic_input_record(synthetic_result)
+            else:
+                record = synthetic_input_record_from_data(data, timing)
+            writer(config.output_dir / "synthetic_input_record.json", record)
 
         history_state: dict[str, Any] = {
             "summary_history": _read_posterior_summary_history(config.output_dir),
@@ -742,93 +778,8 @@ def _append_convergence_history(
 
 
 def synthetic_dataset(config: Phase1CConfig) -> tuple[FrozenPhase1BData, TimingReference, dict[str, float]]:
-    """Build a small synthetic frozen Phase 1B-like dataset for sampler validation."""
-    rng = np.random.default_rng(config.random_seed + 77)
-    period = 3.0
-    original_epoch = 10.0
-    event_ids = np.arange(8)
-    offsets = np.linspace(-0.35, 0.35, 28)
-    time = np.concatenate([original_epoch + event * period + offsets for event in event_ids])
-    event_number = np.concatenate([np.full(offsets.size, event, dtype=int) for event in event_ids])
-    predicted_center = original_epoch + event_number * period
-    exposure_days = np.full(time.size, 0.02)
-    true = PhysicalSample(
-        rp=0.08,
-        a=8.5,
-        b=0.35,
-        q1=0.30,
-        q2=0.40,
-        jitter=0.00008,
-        period=period,
-        mid_epoch=original_epoch + 4 * period,
-        original_epoch=original_epoch,
-    )
-    model = batman_flux(
-        time,
-        exposure_days,
-        rp=true.rp,
-        a=true.a,
-        b=true.b,
-        q1=true.q1,
-        q2=true.q2,
-        period=true.period,
-        t0=true.original_epoch,
-        supersample_factor=config.supersample_factor,
-    )
-    flux_uncertainty = rng.uniform(0.00008, 0.00013, size=time.size)
-    flux = np.empty_like(time)
-    for event in event_ids:
-        mask = event_number == event
-        x = (time[mask] - predicted_center[mask]) / np.max(np.abs(offsets))
-        c0 = rng.normal(1.0, config.baseline_intercept_sigma)
-        c1 = rng.normal(0.0, config.baseline_slope_sigma)
-        noise = rng.normal(0.0, np.sqrt(flux_uncertainty[mask] ** 2 + true.jitter**2))
-        flux[mask] = model[mask] * (c0 + c1 * x) + noise
-    deterministic_parameters = {
-        "rp_over_rstar": true.rp,
-        "a_over_rstar": true.a,
-        "impact_parameter": true.b,
-        "q1": true.q1,
-        "q2": true.q2,
-        "white_noise_jitter": true.jitter,
-        "period_days": true.period,
-        "transit_time": true.original_epoch,
-    }
-    data = FrozenPhase1BData(
-        time=time,
-        flux=flux,
-        flux_uncertainty=flux_uncertainty,
-        event_number=event_number,
-        predicted_center=predicted_center,
-        product_id=np.full(time.size, "synthetic"),
-        quarter=np.full(time.size, "synthetic"),
-        exposure_days=exposure_days,
-        deterministic_parameters=deterministic_parameters,
-        limb_darkening={"q1": true.q1, "q2": true.q2, "q1_sigma": 0.04, "q2_sigma": 0.04},
-        phase1b_configuration={
-            "supersample_factor": config.supersample_factor,
-            "timing_refinement_t0_half_width_duration_scale": config.mid_epoch_half_width_duration_scale,
-        },
-        phase1b_summary=_synthetic_phase1b_summary(period),
-        provenance={"cadence_counts": {"phase1b_fit_cadence_count": int(time.size)}},
-        input_manifest={"manifest_sha256": "synthetic", "residuals_csv_used_as_input": False, "files": []},
-    )
-    timing = build_timing_reference(data, config)
-    injected = {
-        "rp_over_rstar": true.rp,
-        "a_over_rstar": true.a,
-        "impact_parameter": true.b,
-        "q1": true.q1,
-        "q2": true.q2,
-        "white_noise_jitter": true.jitter,
-        "period_days": true.period,
-        "transit_time_original_reference": true.original_epoch,
-        "transit_time_mid_mission_reference": true.mid_epoch,
-    }
-    vector = physical_to_vector(true, timing)
-    if not np.isfinite(log_probability(vector, data, config, timing)):
-        raise RuntimeError("Synthetic injected solution has nonfinite posterior density.")
-    return data, timing, injected
+    """Compatibility wrapper for the fast 224-cadence toy synthetic dataset."""
+    return build_toy_synthetic_dataset(config).legacy_tuple()
 
 
 def build_phase1c_provenance(
@@ -851,6 +802,7 @@ def build_phase1c_provenance(
         },
         "dependencies": dependency_versions(),
         "phase1b_input_manifest": data.input_manifest,
+        "synthetic_dataset_identity": data.input_manifest.get("synthetic_dataset_identity"),
         "phase1c_configuration": config.to_dict(),
         "execution_parallelism": execution_provenance(config),
         "checkpoint_metadata": checkpoint_metadata(data, config, mode=mode),
@@ -898,8 +850,7 @@ def update_run_index(base_output_dir: Path, config: Phase1CConfig, mode: str, st
 
 def _synthetic_summary(
     config: Phase1CConfig,
-    timing: TimingReference,
-    injected: dict[str, float],
+    synthetic_result: SyntheticDatasetResult,
     sampler_result: dict[str, Any],
     *,
     recovery: bool,
@@ -907,57 +858,289 @@ def _synthetic_summary(
     posterior = pd.read_csv(config.output_dir / "posterior_parameter_summary.csv")
     diagnostics = _read_json(config.output_dir / "sampler_diagnostics.json")
     ensemble = pd.read_csv(config.output_dir / "ensemble_summary.csv")
-    rows = []
-    for _, row in posterior.iterrows():
-        parameter = row["parameter"]
-        if parameter not in injected:
-            continue
-        rows.append(
-            {
-                "parameter": parameter,
-                "injected_value": injected[parameter],
-                "posterior_median": float(row["median"]),
-                "q16": float(row["q16"]),
-                "q84": float(row["q84"]),
-                "q02_5": float(row["q02_5"]),
-                "q97_5": float(row["q97_5"]),
-                "interval_68_width": float(row["q84"] - row["q16"]),
-                "interval_95_width": float(row["q97_5"] - row["q02_5"]),
-                "injected_inside_68_percent_interval": bool(row["q16"] <= injected[parameter] <= row["q84"]),
-                "injected_inside_95_percent_interval": bool(row["q02_5"] <= injected[parameter] <= row["q97_5"]),
-            }
-        )
-    all_inside_95 = all(row["injected_inside_95_percent_interval"] for row in rows)
-    if diagnostics["status"] != "converged":
+    coverage_error = None
+    try:
+        rows = _strict_recovery_rows(posterior, synthetic_result.injected_parameters)
+    except ValueError as exc:
+        rows = []
+        coverage_error = str(exc)
+    recovery_gate = (
+        _recovery_gate_record(config, synthetic_result, diagnostics, ensemble, rows, coverage_error)
+        if recovery
+        else {"authoritative": False, "status": "not_applicable", "criteria": {}}
+    )
+    if recovery:
+        status = recovery_gate["status"]
+    elif diagnostics["status"] != "converged":
         status = "smoke_test_completed_nonconverged"
-    elif recovery and all_inside_95:
-        status = "converged_recovery_passed"
-    elif recovery:
-        status = "converged_recovery_failed"
     else:
         status = "smoke_test_completed_converged"
     return {
         "status": status,
         "run_id": config.run_id,
         "run_directory": str(config.output_dir),
+        "dataset_design": synthetic_result.dataset_design,
+        "generator_version": synthetic_result.identity.get("generator_version"),
         "configured_steps": config.synthetic_recovery_steps if recovery else config.synthetic_steps,
         "configured_walkers": config.n_walkers,
         "configured_ensembles": config.n_ensembles,
         "configured_warmup_steps": config.warmup_steps,
         "convergence_diagnostics": diagnostics,
-        "injected_parameters": injected,
+        "dataset_identity": synthetic_result.identity,
+        "injected_parameters": synthetic_result.injected_parameters,
+        "derived_timing": synthetic_result.derived_timing,
+        "required_recovery_parameters": list(RECOVERY_PARAMETER_REGISTRY),
         "parameter_recovery_rows": rows,
+        "parameter_recovery_validation_error": coverage_error,
+        "recovery_gate": recovery_gate,
         "per_ensemble_summary": ensemble.to_dict(orient="records"),
         "retained_log_posterior_neighborhood_fractions": _log_posterior_neighborhood_fractions(config),
         "coverage_statement": (
             "Interval coverage from this nonconverged smoke chain is not validation."
             if diagnostics["status"] != "converged"
-            else "Converged synthetic recovery status is determined by configured convergence criteria."
+            else "Synthetic recovery status is determined by the explicit recovery_gate record."
         ),
         "sampler_result": sampler_result,
         "nonproduction": True,
-        "timing_reference": timing.__dict__,
+        "timing_reference": synthetic_result.timing.__dict__,
     }
+
+
+def _strict_recovery_rows(posterior: pd.DataFrame, injected: dict[str, float]) -> list[dict[str, Any]]:
+    missing_injected = [parameter for parameter in RECOVERY_PARAMETER_REGISTRY if parameter not in injected]
+    if missing_injected:
+        raise ValueError(f"Injected registry is missing required parameters: {missing_injected}")
+    extra_counts = {parameter: 0 for parameter in RECOVERY_PARAMETER_REGISTRY}
+    rows = []
+    for parameter in RECOVERY_PARAMETER_REGISTRY:
+        value = float(injected[parameter])
+        if not np.isfinite(value):
+            raise ValueError(f"Injected value for {parameter} is nonfinite.")
+        matching = posterior[posterior["parameter"] == parameter]
+        if len(matching) != 1:
+            raise ValueError(f"Posterior summary must contain {parameter!r} exactly once; found {len(matching)}.")
+        extra_counts[parameter] += len(matching)
+        row = matching.iloc[0]
+        q16 = float(row["q16"])
+        q84 = float(row["q84"])
+        q02_5 = float(row["q02_5"])
+        q97_5 = float(row["q97_5"])
+        median = float(row["median"])
+        if not all(np.isfinite(item) for item in (q16, q84, q02_5, q97_5, median)):
+            raise ValueError(f"Posterior interval for {parameter} contains nonfinite values.")
+        if not (q02_5 <= q16 <= q84 <= q97_5):
+            raise ValueError(f"Posterior interval for {parameter} is malformed or unordered.")
+        rows.append(
+            {
+                "parameter": parameter,
+                "injected_value": value,
+                "posterior_median": median,
+                "q16": q16,
+                "q84": q84,
+                "q02_5": q02_5,
+                "q97_5": q97_5,
+                "interval_68_width": float(q84 - q16),
+                "interval_95_width": float(q97_5 - q02_5),
+                "injected_inside_68_percent_interval": bool(q16 <= value <= q84),
+                "injected_inside_95_percent_interval": bool(q02_5 <= value <= q97_5),
+            }
+        )
+    return rows
+
+
+def _recovery_gate_record(
+    config: Phase1CConfig,
+    synthetic_result: SyntheticDatasetResult,
+    diagnostics: dict[str, Any],
+    ensemble: pd.DataFrame,
+    rows: list[dict[str, Any]],
+    coverage_error: str | None,
+) -> dict[str, Any]:
+    identity = synthetic_result.identity
+    design = synthetic_result.dataset_design
+    hdf_iterations = _hdf_iteration_counts(config)
+    runtime = _read_json_if_exists(config.output_dir / "sampler_runtime.json")
+    strategies = [str(item.get("strategy", "")) for item in runtime.get("ensemble_results", [])]
+    boundary_audit = _boundary_audit(rows, synthetic_result.injected_parameters, config, synthetic_result.timing)
+    criteria = {
+        "dataset_design_is_realistic_frozen_cadence_v1": design == REALISTIC_DATASET_DESIGN,
+        "generator_and_identity_validation_pass": _identity_matches_generated_data(synthetic_result),
+        "source_manifest_is_expected_frozen_manifest": identity.get("source_phase1b_manifest_sha256")
+        == "bed35b602e925d5da93773ee72037dbf5019498e3bb1308975f7aa9f9671082f",
+        "four_ensembles_configured_and_represented": int(config.n_ensembles) == 4
+        and len(ensemble) == 4
+        and len(hdf_iterations) == 4,
+        "thirty_two_walkers_configured": int(config.n_walkers) == 32,
+        "every_hdf_has_same_completed_target_length": bool(hdf_iterations)
+        and len(hdf_iterations) == int(config.n_ensembles)
+        and len(set(hdf_iterations.values())) == 1,
+        "diagnostics_status_is_converged": diagnostics.get("status") == "converged",
+        "finite_log_posterior_fraction_is_one": diagnostics.get("finite_log_probability_fraction") == 1.0,
+        "complete_valid_autocorrelation": bool(
+            diagnostics.get("criteria", {}).get("complete_valid_autocorrelation")
+        ),
+        "chain_length_exceeds_50_times_tau": bool(
+            diagnostics.get("criteria", {}).get("chain_length_exceeds_tau_multiple")
+        ),
+        "bulk_ess_criterion_passes": bool(diagnostics.get("criteria", {}).get("ess_all_above_minimum")),
+        "tail_ess_criterion_passes": bool(diagnostics.get("criteria", {}).get("tail_ess_all_above_minimum")),
+        "posterior_stability_criterion_passes": bool(
+            diagnostics.get("criteria", {}).get("posterior_summary_stability")
+        ),
+        "independent_ensemble_agreement_passes": bool(
+            diagnostics.get("criteria", {}).get("independent_ensemble_agreement")
+        ),
+        "no_severe_walker_pathology": bool(diagnostics.get("criteria", {}).get("no_severe_walker_pathology")),
+        "broad_prior_informed_ensemble_present": "prior_informed" in strategies,
+        "all_eight_required_injected_values_inside_95_intervals": coverage_error is None
+        and len(rows) == len(RECOVERY_PARAMETER_REGISTRY)
+        and all(row["injected_inside_95_percent_interval"] for row in rows),
+        "every_required_interval_available_and_valid": coverage_error is None
+        and len(rows) == len(RECOVERY_PARAMETER_REGISTRY),
+        "hard_boundary_audit_passes": bool(boundary_audit["passed"]),
+    }
+    if design != REALISTIC_DATASET_DESIGN:
+        status = "nonauthoritative_toy_recovery"
+        authoritative = False
+    elif diagnostics.get("status") != "converged":
+        status = "realistic_recovery_nonconverged"
+        authoritative = True
+    elif all(criteria.values()):
+        status = "realistic_recovery_gate_passed"
+        authoritative = True
+    else:
+        status = "realistic_recovery_gate_failed"
+        authoritative = True
+    return {
+        "status": status,
+        "authoritative": authoritative,
+        "dataset_design": design,
+        "failed_criteria": [key for key, value in criteria.items() if not value],
+        "criteria": criteria,
+        "coverage_error": coverage_error,
+        "hdf_iterations": hdf_iterations,
+        "ensemble_strategies": strategies,
+        "boundary_audit": boundary_audit,
+        "legacy_toy_recovery": design == LEGACY_TOY_DATASET_DESIGN,
+    }
+
+
+def _identity_matches_generated_data(synthetic_result: SyntheticDatasetResult) -> bool:
+    identity = synthetic_result.identity
+    if synthetic_result.data.input_manifest.get("manifest_sha256") != identity.get(
+        "overall_canonical_identity_sha256"
+    ):
+        return False
+    if identity.get("generated_synthetic_flux_sha256") != canonical_array_hash(synthetic_result.data.flux):
+        return False
+    return True
+
+
+def _boundary_audit(
+    rows: list[dict[str, Any]],
+    injected: dict[str, float],
+    config: Phase1CConfig,
+    timing: TimingReference,
+) -> dict[str, Any]:
+    row_by_parameter = {row["parameter"]: row for row in rows}
+    audit_rows = []
+    failures = []
+    for parameter in RECOVERY_PARAMETER_REGISTRY:
+        bounds = _hard_bounds(parameter, config, timing)
+        if bounds is None:
+            audit_rows.append({"parameter": parameter, "applicable": False, "passed": True})
+            continue
+        lower, upper = bounds
+        width = upper - lower
+        tolerance = 64.0 * np.finfo(float).eps * max(1.0, abs(lower), abs(upper))
+        row = row_by_parameter.get(parameter)
+        if row is None:
+            failures.append({"parameter": parameter, "reason": "missing_recovery_row"})
+            audit_rows.append({"parameter": parameter, "applicable": True, "passed": False})
+            continue
+        value = float(injected[parameter])
+        q02_5 = float(row["q02_5"])
+        q97_5 = float(row["q97_5"])
+        median = float(row["posterior_median"])
+        injected_inside = lower + tolerance < value < upper - tolerance
+        interval_inside = lower + tolerance < q02_5 and q97_5 < upper - tolerance
+        passed = bool(injected_inside and interval_inside)
+        if not passed:
+            failures.append(
+                {
+                    "parameter": parameter,
+                    "reason": "boundary_contact_or_outside_support",
+                    "injected_inside": bool(injected_inside),
+                    "interval_inside": bool(interval_inside),
+                }
+            )
+        audit_rows.append(
+            {
+                "parameter": parameter,
+                "applicable": True,
+                "lower": lower,
+                "upper": upper,
+                "tolerance": tolerance,
+                "injected_strictly_inside": bool(injected_inside),
+                "posterior_95_interval_strictly_inside": bool(interval_inside),
+                "normalized_injected_distance_to_lower": (value - lower) / width,
+                "normalized_injected_distance_to_upper": (upper - value) / width,
+                "normalized_median_distance_to_lower": (median - lower) / width,
+                "normalized_median_distance_to_upper": (upper - median) / width,
+                "normalized_q02_5_distance_to_lower": (q02_5 - lower) / width,
+                "normalized_q97_5_distance_to_upper": (upper - q97_5) / width,
+                "passed": passed,
+            }
+        )
+    return {
+        "passed": not failures,
+        "failures": failures,
+        "rows": audit_rows,
+        "tolerance_rule": "64 * machine epsilon * max(1, abs(lower), abs(upper)); no percentage-of-support threshold.",
+    }
+
+
+def _hard_bounds(
+    parameter: str,
+    config: Phase1CConfig,
+    timing: TimingReference,
+) -> tuple[float, float] | None:
+    if parameter == "rp_over_rstar":
+        return tuple(map(float, config.rp_bounds))
+    if parameter == "a_over_rstar":
+        return tuple(map(float, config.a_bounds))
+    if parameter == "impact_parameter":
+        return 0.0, 1.0 + float(config.rp_bounds[1])
+    if parameter in {"q1", "q2"}:
+        return tuple(map(float, config.q_bounds))
+    if parameter == "white_noise_jitter":
+        return float(config.jitter_lower), float(config.jitter_upper)
+    if parameter == "period_days":
+        return (
+            float(timing.period_reference - timing.period_half_width),
+            float(timing.period_reference + timing.period_half_width),
+        )
+    if parameter == "transit_time_mid_mission_reference":
+        return (
+            float(timing.mid_epoch_reference - timing.mid_epoch_half_width),
+            float(timing.mid_epoch_reference + timing.mid_epoch_half_width),
+        )
+    return None
+
+
+def _hdf_iteration_counts(config: Phase1CConfig) -> dict[str, int]:
+    import emcee
+
+    counts = {}
+    for index in range(int(config.n_ensembles)):
+        path = config.output_dir / f"ensemble_{index:02d}.h5"
+        if not path.exists():
+            continue
+        try:
+            counts[path.name] = int(emcee.backends.HDFBackend(str(path), read_only=True).iteration)
+        except (OSError, AttributeError):
+            continue
+    return counts
 
 
 def _log_posterior_neighborhood_fractions(config: Phase1CConfig) -> dict[str, float]:
@@ -1040,13 +1223,7 @@ def _posterior_stability_metric(
 
 
 def _synthetic_input_record(data: FrozenPhase1BData, timing: TimingReference) -> dict[str, Any]:
-    return {
-        "type": "synthetic_phase1c_dataset",
-        "cadence_count": data.cadence_count,
-        "event_count": data.event_count,
-        "timing_reference": timing.__dict__,
-        "residuals_csv_used_as_input": False,
-    }
+    return synthetic_input_record_from_data(data, timing)
 
 
 def _synthetic_phase1b_summary(period: float) -> dict[str, Any]:
@@ -1152,6 +1329,12 @@ def _read_json(path: Path) -> dict[str, Any]:
     import json
 
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _read_json_if_exists(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    return _read_json(path)
 
 
 def _max_numeric(values: dict[str, Any]) -> float | None:

@@ -170,7 +170,7 @@ def test_authoritative_primary_source_and_manifest_requirements(monkeypatch, tmp
     assert selection.manifest["source_requirements"]["expected"]["n_walkers"] == 32
     assert selection.manifest["source_requirements"]["observed"]["warmup_steps"] == 2000
     assert selection.manifest["input_identity"]["kind"] == "phase1b"
-    assert selection.manifest["input_identity"]["manifest_sha256"] == "synthetic"
+    assert selection.manifest["input_identity"]["manifest_sha256"] == data.input_manifest["manifest_sha256"]
     assert selection.manifest["diagnostics_status"] == "converged"
     assert selection.manifest["source_git"] == {"commit": "fixture-commit", "is_dirty": False}
 

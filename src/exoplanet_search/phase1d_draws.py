@@ -11,10 +11,11 @@ import h5py
 import numpy as np
 import pandas as pd
 
-from .phase1c import _validate_synthetic_input_record_if_needed, checkpoint_metadata, synthetic_dataset
+from .phase1c import _validate_synthetic_input_record_if_needed, checkpoint_metadata
 from .phase1c_inputs import load_frozen_phase1b
 from .phase1c_parameters import build_timing_reference, vector_to_physical
 from .phase1c_sampler import validate_checkpoint_metadata
+from .phase1c_synthetic import build_synthetic_dataset_for_mode, dataset_design_from_record
 from .phase1c_types import (
     DIAGNOSTIC_METHODOLOGY_VERSION,
     PARAMETER_ORDER,
@@ -484,11 +485,18 @@ def _load_bound_data_and_timing(
     mode: str,
 ) -> tuple[FrozenPhase1BData, TimingReference, dict[str, Any]]:
     if mode in {"synthetic", "synthetic_recovery"}:
-        data, timing, _ = synthetic_dataset(config)
+        record = _read_json(config.output_dir / "synthetic_input_record.json")
+        result = build_synthetic_dataset_for_mode(config, mode, recorded_input=record)
+        data = result.data
+        timing = result.timing
         _validate_synthetic_input_record_if_needed(data, timing, config, mode)
         return data, timing, {
             "kind": "synthetic",
+            "dataset_design": dataset_design_from_record(record),
             "manifest_sha256": data.input_manifest.get("manifest_sha256"),
+            "synthetic_dataset_identity_sha256": data.input_manifest.get("synthetic_dataset_identity", {}).get(
+                "overall_canonical_identity_sha256"
+            ),
             "synthetic_input_record": str(config.output_dir / "synthetic_input_record.json"),
         }
     data = load_frozen_phase1b(config)
