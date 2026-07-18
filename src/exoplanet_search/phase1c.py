@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import subprocess
 import time
@@ -38,20 +39,25 @@ from .phase1c_sampler import (
     load_backend_chains,
     load_backend_chains_by_ensemble,
     run_ensembles,
+    validate_checkpoint_metadata,
 )
 from .phase1c_synthetic import (
     LEGACY_TOY_DATASET_DESIGN,
     REALISTIC_DATASET_DESIGN,
     RECOVERY_PARAMETER_REGISTRY,
     SyntheticDatasetResult,
+    authoritative_realistic_spec_record,
+    authoritative_realistic_spec_sha256,
     build_synthetic_dataset_for_mode,
     build_toy_synthetic_dataset,
     canonical_array_hash,
+    canonical_payload_hash,
+    recompute_identity_sha,
     synthetic_input_record,
     synthetic_input_record_from_data,
     validate_synthetic_input_record,
 )
-from .phase1c_types import FrozenPhase1BData, Phase1CConfig, TimingReference
+from .phase1c_types import FrozenPhase1BData, PARAMETER_ORDER, Phase1CConfig, TimingReference
 
 PILOT_LABEL = "PILOT - NONPRODUCTION - NONCONVERGED"
 
@@ -135,6 +141,8 @@ def run_phase1c_synthetic_validation(
     )
     payload = _synthetic_summary(run_config, synthetic_result, result, recovery=recovery)
     write_json(run_config.output_dir / "synthetic_recovery_summary.json", payload)
+    if recovery:
+        update_run_index(run_config.output_dir.parent, run_config, mode, payload["status"])
     return payload
 
 
@@ -151,8 +159,8 @@ def summarize_phase1c_checkpoints(config: Phase1CConfig, *, mode: str = "pilot")
     )
     start = time.perf_counter()
     try:
-        data, timing = _load_summarize_data(run_config, mode)
-        _validate_synthetic_input_record_if_needed(data, timing, run_config, mode)
+        data, timing, synthetic_result = _load_summarize_data(run_config, mode)
+        _validate_synthetic_input_record_if_needed(data, timing, run_config, mode, synthetic_result=synthetic_result)
         result = _summarize_phase1c_checkpoints(run_config, data, timing, mode=mode)
     except KeyboardInterrupt:
         _finish_invocation(
@@ -434,21 +442,70 @@ def _write_synthetic_dataset_artifacts(
     *,
     immutable: bool,
 ) -> None:
+    if result.dataset_design != REALISTIC_DATASET_DESIGN:
+        return
     if result.baseline_coefficients_csv is None:
         return
     path = config.output_dir / "synthetic_baseline_coefficients.csv"
-    if immutable and path.exists():
+    if immutable:
+        _validate_synthetic_baseline_audit_artifact(config, result)
         return
     path.write_text(result.baseline_coefficients_csv, encoding="utf-8")
+    _validate_synthetic_baseline_audit_artifact(config, result)
 
 
-def _load_summarize_data(config: Phase1CConfig, mode: str) -> tuple[FrozenPhase1BData, TimingReference]:
+def _validate_synthetic_baseline_audit_artifact(
+    config: Phase1CConfig,
+    result: SyntheticDatasetResult,
+) -> None:
+    if result.dataset_design != REALISTIC_DATASET_DESIGN:
+        return
+    expected = result.baseline_coefficients_csv
+    if expected is None:
+        raise ValueError("Realistic synthetic dataset is missing regenerated baseline audit content.")
+    path = config.output_dir / "synthetic_baseline_coefficients.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"Missing realistic synthetic baseline audit artifact: {path}")
+    recorded = path.read_text(encoding="utf-8")
+    if recorded != expected:
+        raise ValueError("Realistic synthetic baseline audit artifact does not match regenerated coefficients.")
+    sha = hashlib.sha256(recorded.encode("utf-8")).hexdigest()
+    identity_sha = result.identity.get("baseline_coefficients_audit_csv_sha256")
+    if sha != identity_sha:
+        raise ValueError("Realistic synthetic baseline audit artifact SHA does not match dataset identity.")
+    record_path = config.output_dir / "synthetic_input_record.json"
+    if record_path.exists():
+        recorded_record = _read_json(record_path)
+        record_sha = recorded_record.get("baseline_coefficients_audit_csv_sha256")
+        if record_sha != sha:
+            raise ValueError("Realistic synthetic baseline audit artifact SHA does not match input record.")
+
+
+def _validate_synthetic_resume_preflight(
+    data: FrozenPhase1BData,
+    config: Phase1CConfig,
+    timing: TimingReference,
+    mode: str,
+    result: SyntheticDatasetResult,
+) -> None:
+    _validate_synthetic_input_record_if_needed(data, timing, config, mode, synthetic_result=result)
+    metadata = checkpoint_metadata(data, config, mode=mode)
+    for ensemble_index in range(int(config.n_ensembles)):
+        path = config.output_dir / f"ensemble_{ensemble_index:02d}.h5"
+        if path.exists():
+            validate_checkpoint_metadata(path, metadata, config.random_seed + 1000 * ensemble_index)
+
+
+def _load_summarize_data(
+    config: Phase1CConfig,
+    mode: str,
+) -> tuple[FrozenPhase1BData, TimingReference, SyntheticDatasetResult | None]:
     if mode in {"synthetic", "synthetic_recovery"}:
         record = _read_synthetic_input_record_if_exists(config.output_dir)
         result = build_synthetic_dataset_for_mode(config, mode, recorded_input=record)
-        return result.data, result.timing
+        return result.data, result.timing, result
     data = load_frozen_phase1b(config)
-    return data, build_timing_reference(data, config)
+    return data, build_timing_reference(data, config), None
 
 
 def _validate_synthetic_input_record_if_needed(
@@ -456,6 +513,8 @@ def _validate_synthetic_input_record_if_needed(
     timing: TimingReference,
     config: Phase1CConfig,
     mode: str,
+    *,
+    synthetic_result: SyntheticDatasetResult | None = None,
 ) -> None:
     if mode not in {"synthetic", "synthetic_recovery"}:
         return
@@ -463,8 +522,10 @@ def _validate_synthetic_input_record_if_needed(
     if not path.exists():
         raise FileNotFoundError(f"Missing synthetic input record: {path}")
     recorded = _read_json(path)
-    expected = synthetic_input_record_from_data(data, timing)
+    expected = synthetic_input_record(synthetic_result) if synthetic_result is not None else synthetic_input_record_from_data(data, timing)
     validate_synthetic_input_record(recorded, expected)
+    if synthetic_result is not None:
+        _validate_synthetic_baseline_audit_artifact(config, synthetic_result)
 
 
 def _run_sampling_mode(
@@ -491,11 +552,24 @@ def _run_sampling_mode(
         else:
             writer = _write_json_if_absent if resume else write_json
             if synthetic_result is not None:
-                _write_synthetic_dataset_artifacts(config, synthetic_result, immutable=resume)
                 record = synthetic_input_record(synthetic_result)
+                if resume:
+                    _validate_synthetic_resume_preflight(data, config, timing, mode, synthetic_result)
+                else:
+                    _write_synthetic_dataset_artifacts(config, synthetic_result, immutable=False)
+                    writer(config.output_dir / "synthetic_input_record.json", record)
+                    _validate_synthetic_input_record_if_needed(
+                        data,
+                        timing,
+                        config,
+                        mode,
+                        synthetic_result=synthetic_result,
+                    )
+                    record = None
             else:
                 record = synthetic_input_record_from_data(data, timing)
-            writer(config.output_dir / "synthetic_input_record.json", record)
+            if record is not None:
+                writer(config.output_dir / "synthetic_input_record.json", record)
 
         history_state: dict[str, Any] = {
             "summary_history": _read_posterior_summary_history(config.output_dir),
@@ -958,22 +1032,34 @@ def _recovery_gate_record(
 ) -> dict[str, Any]:
     identity = synthetic_result.identity
     design = synthetic_result.dataset_design
-    hdf_iterations = _hdf_iteration_counts(config)
     runtime = _read_json_if_exists(config.output_dir / "sampler_runtime.json")
     strategies = [str(item.get("strategy", "")) for item in runtime.get("ensemble_results", [])]
+    identity_audit = _identity_audit(synthetic_result)
+    ensemble_target_audit = _ensemble_target_audit(config, ensemble)
     boundary_audit = _boundary_audit(rows, synthetic_result.injected_parameters, config, synthetic_result.timing)
     criteria = {
         "dataset_design_is_realistic_frozen_cadence_v1": design == REALISTIC_DATASET_DESIGN,
-        "generator_and_identity_validation_pass": _identity_matches_generated_data(synthetic_result),
+        "authoritative_v1_specification_matches_exactly": bool(
+            identity_audit["criteria"].get("authoritative_v1_specification_matches_exactly")
+        ),
+        "generator_and_identity_validation_pass": bool(identity_audit["passed"]),
         "source_manifest_is_expected_frozen_manifest": identity.get("source_phase1b_manifest_sha256")
         == "bed35b602e925d5da93773ee72037dbf5019498e3bb1308975f7aa9f9671082f",
         "four_ensembles_configured_and_represented": int(config.n_ensembles) == 4
-        and len(ensemble) == 4
-        and len(hdf_iterations) == 4,
+        and ensemble_target_audit["criteria"]["ensemble_summary_ids_exact_once"]
+        and ensemble_target_audit["criteria"]["expected_hdf_files_exist"],
         "thirty_two_walkers_configured": int(config.n_walkers) == 32,
-        "every_hdf_has_same_completed_target_length": bool(hdf_iterations)
-        and len(hdf_iterations) == int(config.n_ensembles)
-        and len(set(hdf_iterations.values())) == 1,
+        "ensemble_summary_ids_exact_once": ensemble_target_audit["criteria"]["ensemble_summary_ids_exact_once"],
+        "expected_hdf_files_exist": ensemble_target_audit["criteria"]["expected_hdf_files_exist"],
+        "hdf_shapes_match_authoritative_requirements": ensemble_target_audit["criteria"][
+            "hdf_shapes_match_authoritative_requirements"
+        ],
+        "every_hdf_has_same_completed_target_length": ensemble_target_audit["criteria"][
+            "every_hdf_has_same_completed_target_length"
+        ],
+        "hdf_iterations_equal_completed_invocation_target": ensemble_target_audit["criteria"][
+            "hdf_iterations_equal_completed_invocation_target"
+        ],
         "diagnostics_status_is_converged": diagnostics.get("status") == "converged",
         "finite_log_posterior_fraction_is_one": diagnostics.get("finite_log_probability_fraction") == 1.0,
         "complete_valid_autocorrelation": bool(
@@ -1018,22 +1104,74 @@ def _recovery_gate_record(
         "failed_criteria": [key for key, value in criteria.items() if not value],
         "criteria": criteria,
         "coverage_error": coverage_error,
-        "hdf_iterations": hdf_iterations,
+        "identity_audit": identity_audit,
+        "ensemble_target_audit": ensemble_target_audit,
+        "hdf_iterations": ensemble_target_audit["hdf_iterations"],
         "ensemble_strategies": strategies,
         "boundary_audit": boundary_audit,
         "legacy_toy_recovery": design == LEGACY_TOY_DATASET_DESIGN,
     }
 
 
-def _identity_matches_generated_data(synthetic_result: SyntheticDatasetResult) -> bool:
+def _identity_audit(synthetic_result: SyntheticDatasetResult) -> dict[str, Any]:
     identity = synthetic_result.identity
-    if synthetic_result.data.input_manifest.get("manifest_sha256") != identity.get(
-        "overall_canonical_identity_sha256"
-    ):
-        return False
-    if identity.get("generated_synthetic_flux_sha256") != canonical_array_hash(synthetic_result.data.flux):
-        return False
-    return True
+    expected_structural_hashes = _structural_hashes(synthetic_result.data)
+    baseline_rows_hash = canonical_payload_hash({"rows": [dict(row) for row in synthetic_result.baseline_coefficients]})
+    baseline_csv_hash = (
+        hashlib.sha256(synthetic_result.baseline_coefficients_csv.encode("utf-8")).hexdigest()
+        if synthetic_result.baseline_coefficients_csv is not None
+        else None
+    )
+    stored_sha = identity.get("overall_canonical_identity_sha256")
+    recomputed_sha = recompute_identity_sha(identity)
+    criteria = {
+        "overall_identity_sha_recomputes": stored_sha == recomputed_sha,
+        "authoritative_v1_specification_matches_exactly": identity.get("authoritative_v1_specification")
+        == authoritative_realistic_spec_record()
+        and identity.get("authoritative_v1_specification_sha256") == authoritative_realistic_spec_sha256()
+        and identity.get("authoritative_v1_specification_matches_exactly") is True,
+        "derived_manifest_sha_matches_identity": synthetic_result.data.input_manifest.get("manifest_sha256")
+        == stored_sha,
+        "preserved_structural_hashes_match_generated_data": identity.get("preserved_structural_field_hashes")
+        == expected_structural_hashes,
+        "generated_flux_hash_matches_generated_flux": identity.get("generated_synthetic_flux_sha256")
+        == canonical_array_hash(synthetic_result.data.flux),
+        "baseline_coefficient_hash_matches_rows": identity.get("baseline_coefficients_hash_sha256")
+        == baseline_rows_hash,
+        "baseline_audit_csv_hash_matches_generated_csv": identity.get("baseline_coefficients_audit_csv_sha256")
+        == baseline_csv_hash,
+        "observed_flux_used_false": identity.get("observed_flux_used") is False,
+        "residuals_used_false": identity.get("residuals_used") is False,
+        "source_manifest_matches_frozen_source": identity.get("source_phase1b_manifest_sha256")
+        == "bed35b602e925d5da93773ee72037dbf5019498e3bb1308975f7aa9f9671082f",
+        "source_cadence_count_matches_frozen_source": identity.get("source_cadence_count") == 18_041,
+        "source_event_count_matches_frozen_source": identity.get("source_event_count") == 373,
+    }
+    return {
+        "passed": all(criteria.values()),
+        "criteria": criteria,
+        "failed_criteria": [key for key, value in criteria.items() if not value],
+        "observed": {
+            "stored_identity_sha": stored_sha,
+            "recomputed_identity_sha": recomputed_sha,
+            "generated_synthetic_flux_sha256": canonical_array_hash(synthetic_result.data.flux),
+            "baseline_coefficients_hash_sha256": baseline_rows_hash,
+            "baseline_coefficients_audit_csv_sha256": baseline_csv_hash,
+            "preserved_structural_field_hashes": expected_structural_hashes,
+        },
+    }
+
+
+def _structural_hashes(data: FrozenPhase1BData) -> dict[str, str]:
+    return {
+        "time": canonical_array_hash(data.time),
+        "event_number": canonical_array_hash(data.event_number),
+        "predicted_center": canonical_array_hash(data.predicted_center),
+        "exposure_days": canonical_array_hash(data.exposure_days),
+        "flux_uncertainty": canonical_array_hash(data.flux_uncertainty),
+        "product_id": canonical_array_hash(data.product_id),
+        "quarter": canonical_array_hash(data.quarter),
+    }
 
 
 def _boundary_audit(
@@ -1126,6 +1264,71 @@ def _hard_bounds(
             float(timing.mid_epoch_reference + timing.mid_epoch_half_width),
         )
     return None
+
+
+def _ensemble_target_audit(config: Phase1CConfig, ensemble: pd.DataFrame) -> dict[str, Any]:
+    import h5py
+
+    expected_ids = [0, 1, 2, 3]
+    observed_ids = []
+    if "ensemble" in ensemble:
+        observed_ids = [int(value) for value in ensemble["ensemble"].tolist()]
+    hdf_shapes = {}
+    hdf_iterations = {}
+    missing_hdf_files = []
+    shape_failures = []
+    for index in expected_ids:
+        path = config.output_dir / f"ensemble_{index:02d}.h5"
+        if not path.exists():
+            missing_hdf_files.append(path.name)
+            continue
+        try:
+            with h5py.File(path, "r") as hdf:
+                chain = hdf["mcmc/chain"]
+                shape = tuple(int(value) for value in chain.shape)
+                hdf_shapes[path.name] = list(shape)
+                if len(shape) == 3:
+                    hdf_iterations[path.name] = int(shape[0])
+                    if int(shape[1]) != 32 or int(shape[2]) != len(PARAMETER_ORDER):
+                        shape_failures.append(path.name)
+                else:
+                    shape_failures.append(path.name)
+        except (OSError, KeyError):
+            shape_failures.append(path.name)
+    expected_target = _latest_completed_invocation_target(config.output_dir)
+    equal_iterations = bool(hdf_iterations) and len(hdf_iterations) == 4 and len(set(hdf_iterations.values())) == 1
+    target_match = bool(equal_iterations and expected_target is not None and next(iter(hdf_iterations.values())) == expected_target)
+    observed_counts = {ensemble_id: observed_ids.count(ensemble_id) for ensemble_id in sorted(set(observed_ids))}
+    criteria = {
+        "ensemble_summary_ids_exact_once": observed_ids == expected_ids,
+        "expected_hdf_files_exist": not missing_hdf_files,
+        "hdf_shapes_match_authoritative_requirements": not missing_hdf_files and not shape_failures,
+        "every_hdf_has_same_completed_target_length": equal_iterations,
+        "hdf_iterations_equal_completed_invocation_target": target_match,
+    }
+    return {
+        "passed": all(criteria.values()),
+        "criteria": criteria,
+        "failed_criteria": [key for key, value in criteria.items() if not value],
+        "expected_ensemble_ids": expected_ids,
+        "observed_ensemble_ids": observed_ids,
+        "observed_ensemble_id_counts": observed_counts,
+        "expected_hdf_filenames": [f"ensemble_{index:02d}.h5" for index in expected_ids],
+        "missing_hdf_files": missing_hdf_files,
+        "hdf_shapes": hdf_shapes,
+        "hdf_shape_failures": shape_failures,
+        "hdf_iterations": hdf_iterations,
+        "completed_invocation_target_total_steps": expected_target,
+    }
+
+
+def _latest_completed_invocation_target(output_dir: Path) -> int | None:
+    completed = [item for item in _read_invocation_history(output_dir) if item.get("status") == "completed"]
+    if not completed:
+        return None
+    latest = max(completed, key=lambda item: int(item.get("invocation_sequence_number", -1)))
+    target = latest.get("target_total_steps")
+    return None if target is None else int(target)
 
 
 def _hdf_iteration_counts(config: Phase1CConfig) -> dict[str, int]:

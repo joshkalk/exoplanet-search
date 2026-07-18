@@ -9,9 +9,10 @@ import io
 import json
 import math
 import platform
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version
-from typing import Any, Mapping
+from typing import Any
 
 import numpy as np
 
@@ -57,6 +58,18 @@ REALISTIC_INJECTED_PARAMETERS = {
     "period_days": 3.548715437667639,
     "transit_time_mid_mission_reference": 853.9003172957171,
     "transit_time_original_reference": 122.86493713618336,
+}
+
+AUTHORITATIVE_REALISTIC_SPEC_RECORD = {
+    "dataset_design": REALISTIC_DATASET_DESIGN,
+    "generator_version": REALISTIC_GENERATOR_VERSION,
+    "source_manifest_sha256": EXPECTED_REALISTIC_SOURCE_MANIFEST_SHA256,
+    "source_cadence_count": EXPECTED_REALISTIC_CADENCE_COUNT,
+    "source_event_count": EXPECTED_REALISTIC_EVENT_COUNT,
+    "synthetic_flux_seed": REALISTIC_SYNTHETIC_FLUX_SEED,
+    "supersample_factor": REALISTIC_SUPERSAMPLE_FACTOR,
+    "mid_mission_cycle": REALISTIC_MID_MISSION_CYCLE,
+    "injected_parameters": dict(REALISTIC_INJECTED_PARAMETERS),
 }
 
 
@@ -250,12 +263,13 @@ def build_realistic_synthetic_recovery_dataset(
     spec = spec or RealisticSyntheticRecoverySpec()
     if spec.dataset_design != REALISTIC_DATASET_DESIGN:
         raise ValueError(f"Realistic recovery requires dataset_design={REALISTIC_DATASET_DESIGN!r}.")
-    if spec.supersample_factor != REALISTIC_SUPERSAMPLE_FACTOR:
-        raise ValueError("The realistic frozen-cadence generator v1 requires supersampling factor 11.")
-    if config.supersample_factor != REALISTIC_SUPERSAMPLE_FACTOR:
-        raise ValueError("Realistic recovery requires Phase1CConfig.supersample_factor == 11.")
+    if int(spec.supersample_factor) <= 0:
+        raise ValueError("Realistic recovery supersample factor must be positive.")
+    if int(config.supersample_factor) != int(spec.supersample_factor):
+        raise ValueError("Realistic recovery config supersample factor must match the synthetic specification.")
     source = source_data if source_data is not None else load_frozen_phase1b(config)
-    _validate_realistic_source_preflight(source, spec)
+    if realistic_spec_record(spec) == authoritative_realistic_spec_record():
+        _validate_realistic_source_preflight(source, spec)
     timing = build_timing_reference(source, config)
     true = _realistic_physical_sample(spec)
     _validate_realistic_timing(true, spec)
@@ -381,7 +395,7 @@ def synthetic_input_record_from_data(data: FrozenPhase1BData, timing: TimingRefe
     identity = data.input_manifest.get("synthetic_dataset_identity")
     if identity is None:
         return legacy_synthetic_input_record(data, timing)
-    return {
+    record = {
         "type": SYNTHETIC_RECORD_TYPE,
         "schema_version": SYNTHETIC_RECORD_SCHEMA_VERSION,
         "dataset_design": identity.get("dataset_design"),
@@ -396,6 +410,9 @@ def synthetic_input_record_from_data(data: FrozenPhase1BData, timing: TimingRefe
         "derived_timing": identity.get("derived_timing", {}),
         "dataset_identity": identity,
     }
+    if "baseline_coefficients_audit_csv_sha256" in identity:
+        record["baseline_coefficients_audit_csv_sha256"] = identity["baseline_coefficients_audit_csv_sha256"]
+    return record
 
 
 def legacy_synthetic_input_record(data: FrozenPhase1BData, timing: TimingReference) -> dict[str, Any]:
@@ -425,20 +442,58 @@ def validate_synthetic_input_record(
         elif recorded_value != value:
             raise ValueError(f"synthetic_input_record.json timing mismatch for {key}.")
     design = dataset_design_from_record(recorded)
-    if design == LEGACY_TOY_DATASET_DESIGN:
+    expected_design = dataset_design_from_record(expected)
+    if design == LEGACY_TOY_DATASET_DESIGN and expected_design == LEGACY_TOY_DATASET_DESIGN:
         return
-    expected_design = expected.get("dataset_design")
-    if design != expected_design:
+    if design == LEGACY_TOY_DATASET_DESIGN:
         raise ValueError("synthetic_input_record.json mismatch for dataset_design.")
-    expected_identity = expected.get("dataset_identity", {})
-    recorded_identity = recorded.get("dataset_identity", {})
+    if recorded.get("schema_version") != SYNTHETIC_RECORD_SCHEMA_VERSION:
+        raise ValueError("synthetic_input_record.json mismatch for schema_version.")
+    if design != expected.get("dataset_design"):
+        raise ValueError("synthetic_input_record.json mismatch for dataset_design.")
+    if design != REALISTIC_DATASET_DESIGN:
+        recorded_identity = recorded.get("dataset_identity", {})
+        expected_identity = expected.get("dataset_identity", {})
+        for key in (
+            "overall_canonical_identity_sha256",
+            "generated_synthetic_flux_sha256",
+            "baseline_coefficients_hash_sha256",
+        ):
+            if recorded_identity.get(key) != expected_identity.get(key):
+                raise ValueError(f"synthetic_input_record.json identity mismatch for {key}.")
+        return
     for key in (
-        "overall_canonical_identity_sha256",
-        "generated_synthetic_flux_sha256",
-        "baseline_coefficients_hash_sha256",
+        "generator_version",
+        "cadence_count",
+        "event_count",
+        "observed_flux_used",
+        "residuals_used",
+        "residuals_csv_used_as_input",
+        "injected_parameters",
+        "derived_timing",
     ):
-        if recorded_identity.get(key) != expected_identity.get(key):
-            raise ValueError(f"synthetic_input_record.json identity mismatch for {key}.")
+        if recorded.get(key) != expected.get(key):
+            raise ValueError(f"synthetic_input_record.json mismatch for {key}.")
+    if recorded.get("observed_flux_used") is not False:
+        raise ValueError("synthetic_input_record.json requires observed_flux_used=false.")
+    if recorded.get("residuals_used") is not False:
+        raise ValueError("synthetic_input_record.json requires residuals_used=false.")
+    recorded_identity = recorded.get("dataset_identity")
+    expected_identity = expected.get("dataset_identity")
+    if not isinstance(recorded_identity, Mapping) or not isinstance(expected_identity, Mapping):
+        raise ValueError("synthetic_input_record.json missing complete dataset_identity.")
+    recorded_recomputed = recompute_identity_sha(recorded_identity)
+    if recorded_identity.get("overall_canonical_identity_sha256") != recorded_recomputed:
+        raise ValueError("synthetic_input_record.json dataset_identity SHA does not recompute.")
+    expected_recomputed = recompute_identity_sha(expected_identity)
+    if expected_identity.get("overall_canonical_identity_sha256") != expected_recomputed:
+        raise ValueError("Regenerated synthetic dataset identity SHA does not recompute.")
+    if recorded_identity != expected_identity:
+        raise ValueError("synthetic_input_record.json complete dataset_identity mismatch.")
+    if set(recorded.keys()) != set(expected.keys()):
+        raise ValueError("synthetic_input_record.json has unexpected or missing fields.")
+    if recorded != expected:
+        raise ValueError("synthetic_input_record.json complete record mismatch.")
 
 
 def baseline_coefficients_csv(rows: list[dict[str, float | int]] | tuple[dict[str, float | int], ...]) -> str:
@@ -476,6 +531,44 @@ def canonical_array_hash(array: np.ndarray) -> str:
 def canonical_payload_hash(payload: Mapping[str, Any]) -> str:
     """Hash a JSON-canonical payload."""
     return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
+
+
+def authoritative_realistic_spec_record() -> dict[str, Any]:
+    """Return the frozen authoritative v1 specification record."""
+    return copy.deepcopy(AUTHORITATIVE_REALISTIC_SPEC_RECORD)
+
+
+def authoritative_realistic_spec_sha256() -> str:
+    """Return the canonical SHA-256 of the frozen authoritative v1 spec."""
+    return canonical_payload_hash(authoritative_realistic_spec_record())
+
+
+def realistic_spec_record(spec: RealisticSyntheticRecoverySpec) -> dict[str, Any]:
+    """Return the canonical specification record represented by a low-level spec object."""
+    return {
+        "dataset_design": spec.dataset_design,
+        "generator_version": spec.generator_version,
+        "source_manifest_sha256": spec.expected_source_manifest_sha256,
+        "source_cadence_count": spec.expected_cadence_count,
+        "source_event_count": spec.expected_event_count,
+        "synthetic_flux_seed": int(spec.synthetic_flux_seed),
+        "supersample_factor": int(spec.supersample_factor),
+        "mid_mission_cycle": int(spec.mid_mission_cycle),
+        "injected_parameters": {key: float(value) for key, value in spec.injected_parameters.items()},
+    }
+
+
+def recompute_identity_sha(identity: Mapping[str, Any]) -> str:
+    """Recompute an identity SHA after removing its embedded SHA field."""
+    core = dict(identity)
+    core.pop("overall_canonical_identity_sha256", None)
+    return canonical_payload_hash(core)
+
+
+def identity_sha_matches(identity: Mapping[str, Any]) -> bool:
+    """Return whether an identity's embedded SHA matches its canonical content."""
+    stored = identity.get("overall_canonical_identity_sha256")
+    return isinstance(stored, str) and stored == recompute_identity_sha(identity)
 
 
 def _realistic_physical_sample(spec: RealisticSyntheticRecoverySpec) -> PhysicalSample:
@@ -576,6 +669,8 @@ def _realistic_identity(
     child_sequences: tuple[np.random.SeedSequence, np.random.SeedSequence],
 ) -> dict[str, Any]:
     injected = _realistic_injected_registry(spec)
+    spec_record = realistic_spec_record(spec)
+    spec_sha = canonical_payload_hash(spec_record)
     derived_timing = {
         "mid_mission_cycle": int(spec.mid_mission_cycle),
         "transit_time_original_reference": injected["transit_time_original_reference"],
@@ -588,6 +683,11 @@ def _realistic_identity(
     core = {
         "dataset_design": spec.dataset_design,
         "generator_version": spec.generator_version,
+        "authoritative_v1_specification": spec_record,
+        "authoritative_v1_specification_sha256": spec_sha,
+        "authoritative_v1_specification_expected_sha256": authoritative_realistic_spec_sha256(),
+        "authoritative_v1_specification_matches_exactly": spec_record == authoritative_realistic_spec_record()
+        and spec_sha == authoritative_realistic_spec_sha256(),
         "source_phase1b_manifest_sha256": source.input_manifest.get("manifest_sha256"),
         "source_cadence_count": source.cadence_count,
         "source_event_count": source.event_count,

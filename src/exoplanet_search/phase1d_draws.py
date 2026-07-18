@@ -489,7 +489,7 @@ def _load_bound_data_and_timing(
         result = build_synthetic_dataset_for_mode(config, mode, recorded_input=record)
         data = result.data
         timing = result.timing
-        _validate_synthetic_input_record_if_needed(data, timing, config, mode)
+        _validate_synthetic_input_record_if_needed(data, timing, config, mode, synthetic_result=result)
         return data, timing, {
             "kind": "synthetic",
             "dataset_design": dataset_design_from_record(record),
